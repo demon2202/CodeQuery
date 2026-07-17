@@ -1,0 +1,23 @@
+# CodeQuery Backend Dependencies
+# Everything runs locally — no paid APIs, no API keys needed.
+
+# ── Web framework ────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+httpx>=0.27.0            # Async HTTP client for Ollama API calls
+
+# ── Data validation ──────────────────────────────────────────────────────────
+pydantic>=2.6.0
+
+# ── Vector database ──────────────────────────────────────────────────────────
+chromadb>=0.4.22         # Persistent vector DB with HNSW backend + metadata filtering
+
+# ── Embeddings ───────────────────────────────────────────────────────────────
+sentence-transformers>=2.5.1  # Loads jina-embeddings-v2-base-code
+numpy>=1.24.0
+
+# ── AST parsing ──────────────────────────────────────────────────────────────
+tree-sitter>=0.22.0           # Core tree-sitter library
+tree-sitter-python>=0.21.0    # Python grammar
+tree-sitter-javascript>=0.21.0  # JavaScript grammar
+tree-sitter-typescript>=0.21.0  # TypeScript grammar (.ts and .tsx)
