@@ -14,7 +14,6 @@ import hashlib
 import logging
 import re
 import shutil
-import sys
 from pathlib import Path
 from typing import Tuple
 
@@ -154,6 +153,13 @@ async def clone_repo(repo_url: str) -> Tuple[Path, str]:
         commit_hash = "unknown"
     else:
         commit_hash = stdout
+
+    # Verify the clone actually has files (not empty or corrupted)
+    has_files = any(True for _ in repo_path.rglob("*") if _.is_file() and not _.name.startswith("."))
+    if not has_files:
+        logger.error(f"Cloned repo appears empty: {repo_path}")
+        shutil.rmtree(repo_path, ignore_errors=True)
+        raise RuntimeError("Git clone succeeded but the repo directory is empty. The repository might be empty on GitHub.")
 
     return repo_path, commit_hash
 

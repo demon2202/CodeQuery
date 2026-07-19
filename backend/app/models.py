@@ -3,7 +3,7 @@ Pydantic models for CodeQuery API requests and responses.
 """
 
 from typing import Optional
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 # ── Request models ───────────────────────────────────────────────────────────
@@ -29,14 +29,11 @@ class ChatRequest(BaseModel):
         max_length=2000,
         description="Natural-language question about the codebase",
     )
-
-
-class FileContentRequest(BaseModel):
-    """Request to view a file's content."""
-    repo_url: str
-    file_path: str = Field(..., description="Relative path from repo root")
-    start_line: Optional[int] = Field(None, ge=1, description="Start line (1-indexed)")
-    end_line: Optional[int] = Field(None, ge=1, description="End line (1-indexed)")
+    history: list[dict] = Field(
+        default=[],
+        description="Previous Q&A pairs for conversation context. Each dict has 'question' and 'answer' keys.",
+        examples=[[{"question": "What does the app do?", "answer": "It's a web server..."}]],
+    )
 
 
 # ── Response models ──────────────────────────────────────────────────────────

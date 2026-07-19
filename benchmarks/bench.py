@@ -186,22 +186,19 @@ async def run_benchmark(repo_url: str, skip_llm: bool = False) -> dict:
 
     # Step 3: Parse
     print("  [3/5] Parsing with tree-sitter...")
-    parse_result = benchmark_parse(repo_path, walk_result.get("files", []))
-    # Re-do with actual file list since we didn't pass it from walk
     files = walk_source_files(Path(repo_path))
     parse_result = benchmark_parse(repo_path, files)
     results["parse"] = parse_result
     print(f"        {parse_result['time_seconds']}s — {parse_result['total_chunks']} chunks ({json.dumps(parse_result['chunk_types'])})")
     print(f"        avg {parse_result['avg_file_parse_ms']}ms/file, max {parse_result['max_file_parse_ms']}ms/file")
 
-    # Step 4: Embed
+    # Step 4: Embed (reuse chunks from parse step)
     print("  [4/5] Embedding chunks...")
     repo_root = Path(repo_path)
     all_chunks = []
     for file_path, lang in files:
         try:
-            chunks = chunk_file(file_path, repo_root, lang)
-            all_chunks.extend(chunks)
+            all_chunks.extend(chunk_file(file_path, repo_root, lang))
         except Exception:
             pass
 
@@ -209,10 +206,9 @@ async def run_benchmark(repo_url: str, skip_llm: bool = False) -> dict:
     results["embed"] = embed_result
     print(f"        {embed_result['time_seconds']}s — {embed_result['throughput_chunks_per_sec']} chunks/sec")
 
-    # Step 5: Store
+    # Step 5: Store (reuse embeddings from embed step)
     print("  [5/5] Storing in ChromaDB...")
-    texts = [c.content for c in all_chunks]
-    embeddings = encode_batch(texts)
+    embeddings = encode_batch([c.content for c in all_chunks])
     store_result = benchmark_store(repo_url, all_chunks, embeddings)
     results["store"] = store_result
     print(f"        {store_result['time_seconds']}s — {store_result['throughput_chunks_per_sec']} chunks/sec")

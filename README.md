@@ -1,254 +1,230 @@
-<p align="center">
-  <img src="assets/logo.png" alt="CodeQuery Logo" width="550"/>
-</p>
+# CodeQuery — Local RAG over GitHub Repos
 
-<p align="center">
-  <strong>Ask  questions about any public GitHub repository, and get grounded, accurate answers backed by exact file paths and line-level citations.</strong>
-</p>
+> Ask natural-language questions about any public GitHub repo, get grounded answers with exact file paths and line numbers. Everything runs locally — zero paid APIs, zero API keys.
 
-<p align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat-square&logo=python&logoColor=white" alt="Python Version" /></a>
-  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-18%2B-green.svg?style=flat-square&logo=node.js&logoColor=white" alt="Node.js Version" /></a>
-  <a href="https://ollama.ai"><img src="https://img.shields.io/badge/Ollama-qwen2.5--coder:7b-purple.svg?style=flat-square&logo=ollama&logoColor=white" alt="Ollama Model" /></a>
-  <a href="https://github.com/chroma-core/chroma"><img src="https://img.shields.io/badge/VectorDB-ChromaDB-red.svg?style=flat-square" alt="Vector DB" /></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License" /></a>
-</p>
-
-<hr />
-
-## 🌟 Overview
-
-**CodeQuery** is a privacy-first, fully local Retrieval-Augmented Generation (RAG) engine designed for codebase understanding. Paste a repository URL, and CodeQuery will clone it, build an Abstract Syntax Tree (AST) to extract logical code segments, embed them using high-performance local models, and store them in a persistent vector database.
-
-When you chat with CodeQuery, it retrieves the most relevant semantic code blocks and generates precise answers with inline citations (e.g. `src/auth.py:42-67`). **Everything runs locally on your machine — zero paid APIs, zero third-party telemetry, and complete code privacy.**
+**How it works:** Paste a repo URL → CodeQuery clones it, parses the AST, embeds every code chunk, and stores them in a local vector DB. Then ask questions like "where is auth handled?" and get answers that cite `src/auth.py:42-67` with the actual code inline.
 
 ---
 
-## 🚀 Key Features
+## Architecture Decisions
 
-*   🌳 **AST-Aware Smart Chunking**: Naive line-splitting breaks functions or class blocks mid-way, making them useless for context. CodeQuery uses `tree-sitter` to parse code structure and sets chunk boundaries around complete classes, functions, and methods.
-*   🔐 **100% Privacy & Local Execution**: Harnesses [Ollama](https://ollama.ai) for local generation and `sentence-transformers` for local vector embeddings. No cloud APIs, no data leaks, no internet required once setup is complete.
-*   ⚡ **Structured Metadata Filtering**: Built on top of [ChromaDB](https://www.trychroma.com/), allowing immediate metadata-filtered queries by programming language, file path, or AST node type without needing parallel indexes.
-*   🎨 **Immersive Developer UI**: Features a beautiful Vite + React interface complete with dynamic 3D background elements (powered by Three.js/PixelBlast), real-time indexing progress, and clean citation cards with syntax-highlighted code.
-*   📈 **Real-Time Diagnostics**: Health check systems inspect backend connectivity, local model warming, and system statuses dynamically.
+### Why tree-sitter for chunking, not line-splitting?
 
----
+Naive line-splitting breaks functions mid-way. Neither half is useful for retrieval. Tree-sitter parses code into an AST and uses function/class/method boundaries as chunk edges, so every chunk is a complete semantic unit. Fallback sliding-window chunks are marked `chunk_type="fallback"` — we don't pretend they're as good.
 
-## 📐 System Architecture
+### Why qwen2.5-coder:7b?
 
-CodeQuery is split into an asynchronous FastAPI backend and a high-fidelity React frontend. Below is the end-to-end data ingestion and querying architecture:
+- **vs CodeLlama:** Trained on 5.5T tokens of code (vs 1T). Better instruction-following for "cite file:line" instructions.
+- **vs 14B+:** 14B generates ~1.5 tok/s — 30s wait per answer. 7B does 3-5 tok/s — fast enough for chat.
+- **vs 3B:** Too small to reliably follow citation instructions. Hallucinates more.
 
-```mermaid
-flowchart TB
-    subgraph Frontend [React Application]
-        UI[Chat & Dashboard UI]
-        PB[Three.js PixelBlast Canvas]
-    end
+### Why ChromaDB (not FAISS)?
 
-    subgraph Backend [FastAPI Engine]
-        API[API Endpoints]
-        Cloner[Git Cloner & Diff Tool]
-        Walker[File Tree Walker]
-        Parser[tree-sitter AST Parser]
-        Embedder[sentence-transformers Batch Embedder]
-        Searcher[Retrieval & Metadata Filter]
-        Gen[Ollama Stream Generator]
-    end
+Built-in metadata filtering (query by language, type, file path) without building a parallel index. Auto-persistence. HNSW backend with same algorithm as FAISS HNSW. The 20% slower bulk insert is a one-time cost.
 
-    subgraph Storage [Local Storage]
-        RepoDir[Local Cloned Repos]
-        Chroma[(ChromaDB Vector Store)]
-    end
+### Why SQLite snapshots instead of full git clones?
 
-    subgraph Models [Local Inference]
-        Ollama[Ollama Server: qwen2.5-coder]
-    end
+After indexing, the full git clone (including `.git` folder) is replaced with a lightweight SQLite snapshot. This saves **80-95% disk space** — the `.git` folder alone is often 50-80% of a repo's size and is completely unnecessary after indexing. The snapshot contains:
+- **File contents** in SQLite (fast single-query lookups for file viewer and search enrichment)
+- **File tree** as JSON (instant load for file tree sidebar)
+- **Repo stats** as JSON (pre-computed, no on-demand recomputation)
 
-    %% Ingestion Pipeline
-    UI -->|1. Submit Repo URL| API
-    API -->|Trigger Ingest| Cloner
-    Cloner -->|Clone/Pull| RepoDir
-    RepoDir -->|Walk Files| Walker
-    Walker -->|Parse AST| Parser
-    Parser -->|Extract Code Blocks| Embedder
-    Embedder -->|Generate Vectors| Chroma
+All features (file tree, code viewer, search enrichment, repo summary) work identically from the snapshot. If no snapshot exists (backward compatibility), endpoints fall back to reading from the filesystem.
 
-    %% Query Pipeline
-    UI -->|2. Ask Question| API
-    API -->|Vector Query| Searcher
-    Searcher -->|Semantic Search| Chroma
-    Searcher -->|Top-K Context Chunks| Gen
-    Gen -->|Formatted Context Prompt| Ollama
-    Ollama -->|Stream Tokens| Gen
-    Gen -->|SSE Stream| UI
-```
+### Why k=12 (not 3 or 20)?
+
+"Where is auth handled?" spans middleware, routes, models — 4-6 chunks. k=3 misses cross-file answers. k=20 adds noise. k=12 balances coverage and precision. Extra chunks don't hurt — the prompt tells the LLM to only cite what's relevant.
+
+### Why streaming tokens?
+
+Buffering a 200-token answer takes 40-60s. Streaming the first token in ~2s and appending makes the UX feel 10x faster. The single biggest perceived-speed win for chat UIs.
+
+### Why embed batch size = 64?
+
+Ollama's `/api/embed` endpoint processes multiple texts per request. Batch size 64 means fewer HTTP round trips — for 404 chunks, that's ~7 requests instead of ~26 with batch size 16. The GPU processes batches efficiently; the bottleneck is HTTP overhead, not GPU compute.
 
 ---
 
-## ⚡ Technical Decisions & Rationale
-
-### 1. Why Tree-Sitter for Chunking?
-Traditional chunking algorithms use arbitrary character limits or line counts, splitting functions in half. CodeQuery maps files to an Abstract Syntax Tree (AST), ensuring code components (functions, classes, decorators) are chunked as atomic, complete semantic blocks. Fallback sliding-window chunking is only used for files without AST support (marked as `chunk_type="fallback"`).
-
-### 2. Why Ollama with `qwen2.5-coder:7b`?
-- **Instruction Following**: Demonstrates outstanding compliance with system prompts requiring exact file path and line citations.
-- **Speed vs. Quality**: A 7B parameter code model achieves a fast time-to-first-token (~2–4s) on consumer GPUs compared to sluggish 14B+ models, while significantly outperforming 3B models which suffer from frequent hallucinations.
-- **Offloadable**: Runs seamlessly locally using Ollama's efficient llama.cpp-based inference backend.
-
-### 3. Why ChromaDB instead of FAISS?
-ChromaDB provides native, rich metadata filtering. When querying, we can restrict search targets to specific programming languages, directory paths, or AST block types (e.g. only functions). FAISS requires building and maintaining secondary indexes to achieve similar filtering capabilities.
-
----
-
-## 🛠️ Installation & Setup
+## Setup
 
 ### Prerequisites
-1. **Python 3.10+** (with virtualenv tool)
+
+1. **Python 3.10+**
 2. **Node.js 18+**
-3. **Git** (configured in your system `PATH`)
-4. **Ollama**: [Download & Install Ollama](https://ollama.ai). Once installed, run:
+3. **Git** (must be in PATH — test with `git --version`)
+4. **Ollama** — [install](https://ollama.ai), then:
    ```bash
    ollama pull qwen2.5-coder:7b
-   ollama serve  # Keep this terminal running in the background
+   ollama pull nomic-embed-text
+   ollama serve   # Keep this running in a separate terminal
    ```
 
----
+### Backend
 
-### Backend Setup
-
-#### 💻 Windows (PowerShell)
-```powershell
-# Navigate to the backend directory
-cd backend
-
-# Create and activate virtual environment
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-# Install requirements
-pip install -r requirements.txt
-
-# Start the server
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-#### 🐧 Linux / macOS (Bash)
+**Linux/macOS:**
 ```bash
-# Navigate to the backend directory
-cd backend
-
-# Create and activate virtual environment
+cd codequery/backend
 python -m venv .venv
 source .venv/bin/activate
-
-# Install requirements
 pip install -r requirements.txt
-
-# Start the server
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-*Note: You can also use the helper scripts `start.bat` (Windows) or `start.sh` (Linux/macOS) in the repository root to automate environment creation and startup.*
+**Windows (PowerShell):**
+```powershell
+cd codequery\backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
----
+Or just run `start.bat` on Windows / `start.sh` on Linux — they do all of the above.
 
-### Frontend Setup
-In a new terminal window:
+You should see:
+```
+INFO:     CodeQuery starting up...
+INFO:     Embedding model ready.
+INFO:     Uvicorn running on http://0.0.0.0:8000
+```
+
+**⚠️ If you see "Failed to warm up Ollama model"** — that's OK if Ollama isn't running yet. Indexing will still work. Chat requires Ollama.
+
+### Frontend
+
 ```bash
-# Navigate to the frontend directory
-cd frontend
-
-# Install UI packages
+cd codequery/frontend
 npm install
-
-# Run the dev server
 npm run dev
 ```
-Open **[http://localhost:5173](http://localhost:5173)** in your browser.
+
+Open http://localhost:5173
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CQ_DATA_DIR` | `./data` | Where snapshots and ChromaDB data are stored |
+| `CQ_OLLAMA_URL` | `http://localhost:11434` | Ollama API URL |
+| `CQ_OLLAMA_MODEL` | `qwen2.5-coder:7b` | Model for generation |
+| `CQ_EMBEDDING_PROVIDER` | `ollama` | Embedding provider: `ollama` or `sentence-transformers` |
+| `CQ_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
+| `CQ_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers fallback model |
+| `CQ_RETRIEVAL_TOP_K` | `12` | Number of chunks to retrieve |
+| `CQ_RETRIEVAL_MIN_SCORE` | `0.10` | Minimum similarity score |
+| `CQ_HNSW_M` | `16` | ChromaDB HNSW M parameter |
+| `CQ_HNSW_EF_CONSTRUCTION` | `100` | ChromaDB HNSW construction EF |
+| `CQ_HNSW_EF_SEARCH` | `50` | ChromaDB HNSW search EF |
+| `CQ_MAX_CHUNK_CHARS` | `2000` | Maximum chunk size in characters |
+| `CQ_MAX_FILE_SIZE` | `500000` | Maximum file size in bytes |
+| `CQ_EMBEDDING_BATCH_SIZE` | `64` | Embedding batch size |
+
+**Ollama tip:** Set `OLLAMA_KEEP_ALIVE=30m` to keep the model loaded between requests.
 
 ---
 
-## ⚙️ Environment Variables
+## Data Directory Structure
 
-Configure CodeQuery by copying `.env.example` to `.env` in the `backend/` directory:
+```
+data/
+├── snapshots/          # Lightweight SQLite snapshots (replaces full git clones)
+│   └── owner_repo/
+│       ├── files.db    # SQLite: file paths, contents, languages
+│       ├── tree.json   # Pre-computed file tree
+│       └── stats.json  # Pre-computed repo stats
+├── chromadb/           # Vector database
+│   ├── chroma.sqlite3  # Main ChromaDB storage
+│   └── meta_*.json     # Per-repo commit hashes
+└── embed_cache.json    # Content-hash embedding cache
+```
 
-| Environment Variable | Default Value | Description |
-| :--- | :--- | :--- |
-| `CQ_DATA_DIR` | `./data` | File path where repositories and database indices are stored. |
-| `CQ_OLLAMA_URL` | `http://localhost:11434` | Address where the local Ollama daemon is running. |
-| `CQ_OLLAMA_MODEL` | `qwen2.5-coder:7b` | Model used for local reasoning and response generation. |
-| `CQ_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Embedding model used. Switch to `jinaai/jina-embeddings-v2-base-code` for coding-specific embeddings. |
-| `CQ_RETRIEVAL_TOP_K` | `8` | The number of semantic chunks to feed into the LLM context. |
-| `CQ_RETRIEVAL_MIN_SCORE`| `0.3` | Minimum cosine similarity score threshold for context inclusion. |
-
-> [!TIP]
-> Setting `OLLAMA_KEEP_ALIVE=30m` (as an OS environment variable) keeps the code model pre-loaded in GPU memory, avoiding cold-start delays.
-
----
-
-## 📊 Performance Metrics
-
-*Benchmarked on a consumer-grade laptop CPU/GPU. You can run benchmarks yourself by executing `python benchmarks/bench.py`.*
-
-| Repository | Code Files | Total Semantic Chunks | Git Clone Time | AST Parse Time | Embedding Time (CPU) | Total Ingest Time |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **[pallets/click](https://github.com/pallets/click)** | 137 | 1,617 | 1.0s | 1.6s | 107s | **~110s** |
-| **[expressjs/express](https://github.com/expressjs/express)** | 174 | 363 | 1.5s | 0.8s | 24s | **~26s** |
-
-*   **Query Latency**: ~0.1s for database retrieval.
-*   **Generation Speed**: ~2–4 seconds for time-to-first-token, streaming at 3-5 tokens per second.
+After indexing, the cloned repo directory is **deleted** — only the snapshot remains. This saves 80-95% disk space compared to keeping the full `.git` folder.
 
 ---
 
-## ⚠️ Limitations & Scope
+## Performance
 
-1. **Cross-File Context Limits**: The LLM context window sees the top `k` chunks. If a call chain passes through 6 files sequentially, retrieval may miss intermediate files, limiting multi-hop tracking.
-2. **Indexing Scale**: Indexing repositories containing >10,000 source files will take 5-15 minutes on CPU. GPU acceleration is highly recommended for massive repositories.
-3. **Local Embedding Library Version**: If using Jina Embeddings v2, you must lock transformers (`pip install "transformers<5.0.0"`) to avoid deprecated internal API conflicts.
-4. **Public Repository Access**: Currently supports cloning public repositories over HTTPS. Private repository access (using SSH/Personal Access Tokens) is slated for a future update.
+Real numbers, not aspirational claims. With `nomic-embed-text` on GPU (RTX 3050 4GB):
+
+| Repo | Files | Chunks | Clone | Parse | Embed+Store | Total |
+|------|-------|--------|-------|-------|-------------|-------|
+| demon2202/GreenRoute | 44 | 404 | ~2s | <1s | ~15s | ~18s |
+| pallets/click | 137 | 1,617 | ~2s | ~2s | ~50s | ~55s |
+
+Key speed factors:
+- **Embed batch size 64** (was 16) — 4x fewer HTTP round trips to Ollama
+- **Embedding cache** — unchanged chunks skip re-embedding on re-index
+- **Pre-computed tree/stats** — file tree and summary load instantly, no on-demand filesystem walks
+- **SQLite snapshots** — file content lookups are single SQL queries (~1ms)
+
+**Retrieval:** ~0.2s per query. **First token:** ~2-4s warm, ~12-15s cold start.
 
 ---
 
-## 📁 Repository Structure
+## Limitations
+
+### 1. Cross-file reasoning is limited
+
+The LLM sees top-12 chunks. A call chain across 5 files (A→B→C→D→E) will likely retrieve A and E but miss B, C, D. RAG is fundamentally limited to retrieved context — call graph analysis would help but isn't implemented.
+
+### 2. Large repos are slow to index
+
+10K+ files = 5-10 minutes. Incremental re-indexing helps after the first run (embedding cache skips unchanged chunks).
+
+### 3. No private repos
+
+Only public GitHub repos via HTTPS. Deliberate v1 scope limit.
+
+### 4. Short snippets = weak embeddings
+
+`x = 1` produces a useless embedding. They're indexed but never show up in top-k. Fine — they don't answer questions anyway.
+
+### 5. Config files have imprecise citations
+
+YAML/TOML/JSON use sliding-window chunking (no AST). You get `config.yaml:1-50` instead of `config.yaml:12-15`.
+
+---
+
+## Project Structure
 
 ```
 codequery/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI application server entrypoint
-│   │   ├── config.py            # Pydantic Configuration loader (.env parser)
-│   │   ├── models.py            # Request/Response validation schemas
+│   │   ├── main.py              # FastAPI app
+│   │   ├── config.py            # Configuration (env vars)
+│   │   ├── models.py            # Pydantic models
 │   │   ├── routers/
-│   │   │   ├── repo.py          # Git clone, AST parsing, and status endpoints
-│   │   │   └── chat.py          # RAG querying, citation lookup, and health status
+│   │   │   ├── repo.py          # Indexing + file content + tree + summary endpoints
+│   │   │   └── chat.py          # Chat + health + starters endpoints
 │   │   ├── services/
-│   │   │   ├── cloner.py        # Local Git clone manager with dirty diff checks
-│   │   │   ├── walker.py        # File syntax inspector and tree walker
-│   │   │   ├── chunker.py       # AST Tree-Sitter chunker (extracts classes/functions)
-│   │   │   ├── embedder.py      # Local SentenceTransformer embeddings manager
-│   │   │   ├── indexer.py       # Orchestrator combining Cloner -> Chunker -> Store
-│   │   │   ├── search.py        # Cosine distance semantic lookup
-│   │   │   └── generator.py     # Local Ollama streaming text generation
+│   │   │   ├── cloner.py        # Git clone + incremental diff
+│   │   │   ├── walker.py        # File tree walker
+│   │   │   ├── chunker.py       # AST-aware chunking (tree-sitter)
+│   │   │   ├── embedder.py      # Batch embedding (Ollama + ST fallback + cache)
+│   │   │   ├── indexer.py       # Orchestrator (clone→parse→embed→store→snapshot)
+│   │   │   ├── snapshot.py      # SQLite snapshot (replaces full git clone)
+│   │   │   ├── search.py        # Retrieval + threshold filtering + context enrichment
+│   │   │   └── generator.py     # LLM streaming + Mermaid + Chart.js prompts
 │   │   └── store/
-│   │       └── chroma_store.py  # ChromaDB wrapper with metadata indexing
-│   └── requirements.txt         # Python library dependencies
+│   │       └── chroma_store.py  # ChromaDB wrapper (HNSW, per-repo collections)
+│   └── requirements.txt
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx              # Main dashboard container with PixelBlast overlay
+│   │   ├── App.jsx
 │   │   ├── components/
-│   │   │   ├── RepoInput.jsx        # Repository clone interface inputs
-│   │   │   ├── IndexingProgress.jsx # Real-time AST parser status graph
-│   │   │   ├── ChatInterface.jsx    # Interactive query console
-│   │   │   └── CodeCitation.jsx     # Lazy-loaded source code viewer
-│   │   └── styles/index.css     # CSS variable tokens and custom theme styling
-│   └── vite.config.js           # Vite compilation and proxy configs
-├── benchmarks/
-│   └── bench.py                 # RAG pipeline performance tester
-└── README.md                    # Project documentation
+│   │   │   ├── RepoInput.jsx
+│   │   │   ├── IndexingProgress.jsx
+│   │   │   ├── ChatInterface.jsx
+│   │   │   ├── MessageContent.jsx  # Chart/Mermaid/code parsing
+│   │   │   ├── ChartComponent.jsx  # Lazy Chart.js
+│   │   │   ├── MermaidDiagram.jsx  # Lazy mermaid
+│   │   │   ├── CodeCitation.jsx    # Lazy code viewer
+│   │   │   ├── FileTree.jsx        # Collapsible sidebar
+│   │   │   ├── RepoSummary.jsx     # Stats + LLM overview
+│   │   │   └── PixelBlast.jsx      # WebGL background
+│   │   └── styles/index.css
+│   └── vite.config.js
+├── benchmarks/bench.py
+└── README.md
 ```
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

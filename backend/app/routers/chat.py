@@ -1,11 +1,13 @@
 """
 Chat endpoint with dynamic starters and Mermaid diagram support.
+Uses snapshots for file-based starter generation (no filesystem needed).
 """
 
 import json
 import logging
 import time
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
@@ -14,13 +16,13 @@ from ..models import ChatRequest, HealthResponse
 from ..services.search import search_cached, search
 from ..services.generator import generate_answer, check_ollama_health
 from ..services.cloner import check_git_available, get_repo_path
+from ..services.snapshot import get_dir_names, get_all_file_paths
 from ..store.chroma_store import get_store
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # Cache health check results to avoid hammering Ollama on every poll.
-# Frontend polls every 3-10s, and each call hit /api/tags — very wasteful.
 _health_cache = {"result": None, "timestamp": 0}
 _HEALTH_CACHE_TTL = 15.0  # seconds
 
@@ -28,7 +30,6 @@ _HEALTH_CACHE_TTL = 15.0  # seconds
 # ── File-pattern based starter questions ───────────────────────────────
 
 _PATTERNS = [
-    # (directory/file pattern, questions)
     ("auth", [
         "How does authentication work?",
         "What auth middleware is used?",
@@ -93,27 +94,33 @@ _PATTERNS = [
 
 
 def _generate_file_based_starters(repo_url: str) -> list[str]:
-    """Generate starter questions based on the repo's file structure."""
+    """Generate starter questions based on the repo's file structure.
+
+    Uses snapshot first, falls back to filesystem.
+    """
     try:
-        repo_path = get_repo_path(repo_url)
-        if not repo_path.exists():
-            return _default_starters()
+        # Try snapshot first
+        dir_names = get_dir_names(repo_url)
+        file_paths = get_all_file_paths(repo_url)
 
-        # Walk the repo to find directory/file names
-        found_dirs = set()
-        found_files = set()
-        for item in repo_path.rglob("*"):
-            if item.is_dir():
-                found_dirs.add(item.name.lower())
-            elif item.is_file():
-                found_files.add(item.name.lower())
+        if not dir_names and not file_paths:
+            # Fallback: try filesystem (backward compatibility)
+            repo_path = get_repo_path(repo_url)
+            if not repo_path.exists():
+                return _default_starters()
 
-        all_names = found_dirs | {f.split(".")[0] for f in found_files}
+            for item in repo_path.rglob("*"):
+                if item.is_dir():
+                    dir_names.add(item.name.lower())
+                elif item.is_file():
+                    file_paths.append(str(item.name).lower())
+
+        # Build a set of all names for pattern matching
+        all_names = dir_names | {fp.split("/")[-1].split(".")[0].lower() for fp in file_paths}
 
         questions = []
         seen = set()
         for pattern, qs in _PATTERNS:
-            # Check if any dir or file matches the pattern
             if any(pattern in name for name in all_names):
                 for q in qs:
                     if q not in seen:
@@ -124,7 +131,6 @@ def _generate_file_based_starters(repo_url: str) -> list[str]:
             if len(questions) >= 4:
                 break
 
-        # Always add a generic question
         if len(questions) < 3:
             questions.append("What does the main entry point do?")
 
@@ -144,11 +150,7 @@ def _default_starters() -> list[str]:
 
 @router.get("/starters")
 async def get_starters(repo_url: str = Query(..., description="Repository URL")):
-    """Get dynamic starter questions for a repo.
-
-    Returns file-based questions immediately. If Ollama is running,
-    also returns LLM-generated questions (may be slower).
-    """
+    """Get dynamic starter questions for a repo."""
     file_starters = _generate_file_based_starters(repo_url)
 
     result = {
@@ -158,17 +160,14 @@ async def get_starters(repo_url: str = Query(..., description="Repository URL"))
 
     # Try to get LLM-generated starters (fast — just one call)
     try:
-        import httpx
         store = get_store()
         stats = store.get_collection_stats(repo_url)
 
         if stats["chunk_count"] > 0:
-            # Get a sample of chunk metadata to understand the repo
             collection = store._get_collection(repo_url)
             sample = collection.peek(limit=20)
             metas = sample.get("metadatas", [])
 
-            # Build a repo summary
             file_set = set()
             func_names = []
             class_names = []
@@ -244,6 +243,7 @@ async def chat(request: ChatRequest):
                 question=request.question,
                 sources=sources,
                 documents=documents,
+                history=request.history,
             ):
                 yield f"data: {json.dumps(event)}\n\n"
 
@@ -260,7 +260,6 @@ async def chat(request: ChatRequest):
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    # Use cached result if fresh enough
     now = time.time()
     cached = _health_cache["result"]
     if cached and (now - _health_cache["timestamp"]) < _HEALTH_CACHE_TTL:

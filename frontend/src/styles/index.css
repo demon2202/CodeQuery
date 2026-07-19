@@ -999,3 +999,378 @@ body {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ── Copy Button ────────────────────────────────────────────────────── */
+
+.copy-btn {
+  background: transparent;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  opacity: 0;
+}
+.copy-btn:hover {
+  color: var(--white);
+  background: var(--surface3);
+}
+.msg-code-top:hover .copy-btn,
+.cite-bar:hover .copy-btn {
+  opacity: 1;
+}
+
+.msg-code-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: 8px;
+}
+
+/* ── Chat Layout (sidebar + main) ──────────────────────────────────── */
+
+.chat-layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.chat-layout > .chat {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── File Tree Sidebar ─────────────────────────────────────────────── */
+
+.file-tree {
+  width: 240px;
+  min-width: 240px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.ft-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.ft-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ft-close {
+  background: transparent;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: all 0.15s;
+}
+.ft-close:hover { color: var(--white); background: var(--surface3); }
+
+.ft-body {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0;
+}
+
+.ft-loading {
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--dim2);
+}
+
+.ft-node {
+  user-select: none;
+}
+
+.ft-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px 3px 0;
+  cursor: pointer;
+  transition: background 0.1s;
+  white-space: nowrap;
+  min-height: 26px;
+}
+.ft-row:hover {
+  background: var(--surface2);
+}
+
+.ft-selected {
+  background: var(--surface3) !important;
+}
+
+.ft-arrow {
+  width: 14px;
+  text-align: center;
+  color: var(--dim2);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+.ft-arrow-file {
+  color: var(--border2);
+}
+
+.ft-icon {
+  font-size: 11px;
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+
+.ft-name {
+  font-size: 12px;
+  color: var(--text2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ft-row:hover .ft-name { color: var(--white); }
+
+/* ── Repo Summary Panel ─────────────────────────────────────────────── */
+
+.summary-card {
+  width: 300px;
+  min-width: 300px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.summary-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.summary-close {
+  background: transparent;
+  border: none;
+  color: var(--dim2);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: all 0.15s;
+}
+.summary-close:hover { color: var(--white); background: var(--surface3); }
+
+.summary-stats {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  padding: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 4px;
+  background: var(--surface2);
+  border-radius: 6px;
+}
+
+.stat-val {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--white);
+  font-family: var(--mono);
+}
+
+.stat-label {
+  font-size: 10px;
+  color: var(--dim2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.summary-langs {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.lang-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lang-name {
+  font-size: 12px;
+  color: var(--text2);
+  width: 70px;
+  flex-shrink: 0;
+}
+
+.lang-bar-track {
+  flex: 1;
+  height: 4px;
+  background: var(--surface3);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.lang-bar-fill {
+  height: 100%;
+  background: var(--grey);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+.lang-pct {
+  font-size: 11px;
+  color: var(--dim2);
+  font-family: var(--mono);
+  width: 30px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.summary-loading {
+  padding: 20px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--dim2);
+}
+
+.summary-error {
+  padding: 12px 14px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.summary-text {
+  padding: 14px;
+  overflow-y: auto;
+  flex: 1;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.summary-text .msg-bold { font-size: 13px; }
+.summary-text .msg-inline-code { font-size: 12px; }
+
+/* ── Active ghost button ─────────────────────────────────────────────── */
+
+.btn-ghost-active {
+  border-color: var(--grey) !important;
+  color: var(--white) !important;
+  background: var(--surface2);
+}
+
+.btn-ghost svg {
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+/* ── Responsive: hide sidebar on small screens ──────────────────────── */
+
+@media (max-width: 768px) {
+  .file-tree, .summary-card {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 10;
+    width: 260px;
+    min-width: 260px;
+    box-shadow: 4px 0 20px rgba(0,0,0,0.5);
+  }
+}
+
+/* ── Copy Answer Button ──────────────────────────────────────────────── */
+
+.copy-answer-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--dim2);
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 6px;
+  opacity: 0;
+  transition: all 0.15s;
+}
+.msg:hover .copy-answer-btn {
+  opacity: 1;
+}
+.copy-answer-btn:hover {
+  color: var(--white);
+  background: var(--surface2);
+  border-color: var(--border2);
+}
+
+/* ── Inline Citations ──────────────────────────────────────────────── */
+
+.msg-cite {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--grey);
+  background: var(--surface2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+/* ── Headings in Answers ────────────────────────────────────────────── */
+
+.msg-heading {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--white);
+  margin: 16px 0 6px 0;
+}
+
+/* ── Bullet Points in Answers ──────────────────────────────────────── */
+
+.msg-bullet {
+  padding-left: 4px;
+  margin: 3px 0;
+  line-height: 1.6;
+}

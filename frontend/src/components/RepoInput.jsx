@@ -35,8 +35,8 @@ export default function RepoInput({ onIndexStart }) {
   return (
     <div className="idle-view">
       <div className="idle-hero">
-        <h2>Ask codebase anything</h2>
-        <p>Paste a public GitHub repo URL. Get grounded answers with exact file references.</p>
+        <h2>Ask your codebase anything</h2>
+        <p>Point at a public GitHub repo. Get grounded answers with exact file:line citations.</p>
       </div>
 
       <form className="url-form" onSubmit={handleSubmit}>
@@ -58,7 +58,7 @@ export default function RepoInput({ onIndexStart }) {
             className={`url-submit ${isValid ? 'url-submit-active' : ''}`}
             disabled={!isValid || submitting}
           >
-            {submitting ? 'Starting…' : 'Find →'}
+            {submitting ? 'Starting…' : 'Index →'}
           </button>
         </div>
         {error && <p className="url-error">{error}</p>}

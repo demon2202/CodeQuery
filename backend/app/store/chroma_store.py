@@ -53,11 +53,62 @@ class ChromaStore:
         self._client = chromadb.PersistentClient(
             path=str(config.CHROMA_DIR),
             settings=ChromaSettings(
-                anonymized_telemetry=False,  # No telemetry — fully local
+                anonymized_telemetry=False,
             ),
         )
         self._collections: dict[str, chromadb.Collection] = {}
-        self._repo_meta: dict[str, dict] = {}  # In-memory cache of per-repo metadata
+        self._repo_meta: dict[str, dict] = {}
+
+        # Auto-cleanup: delete collections with incompatible dimensions
+        # This happens when switching embedding models (e.g., MiniLM → nomic-embed-text)
+        self._cleanup_stale_collections()
+
+    def _cleanup_stale_collections(self) -> None:
+        """Remove collections whose embedding dimension doesn't match the current model.
+        
+        This happens when users switch embedding providers (e.g., all-MiniLM-L6-v2
+        produces 384-dim vectors, nomic-embed-text produces 768-dim). ChromaDB
+        refuses to mix dimensions in the same collection, so stale collections
+        must be deleted before re-indexing.
+        """
+        try:
+            # Lazy import to avoid circular dependency
+            from ..services.embedder import encode_single
+            test_emb = encode_single("__dimension_test__")
+            expected_dim = len(test_emb)
+        except Exception:
+            return  # Can't check — skip cleanup
+
+        try:
+            collections = self._client.list_collections()
+        except Exception:
+            return
+
+        for col_info in collections:
+            try:
+                if isinstance(col_info, str):
+                    collection = self._client.get_collection(name=col_info)
+                elif hasattr(col_info, 'name'):
+                    collection = self._client.get_collection(name=col_info.name)
+                else:
+                    continue
+
+                if collection.count() == 0:
+                    continue  # Empty collection — fine
+
+                peek = collection.peek(limit=1)
+                embs = peek.get("embeddings", [[]])
+                if embs and embs[0]:
+                    existing_dim = len(embs[0])
+                    if existing_dim != expected_dim:
+                        repo_url = (collection.metadata or {}).get("repo_url", "")
+                        logger.warning(
+                            f"Stale collection '{collection.name}' (dim={existing_dim}, "
+                            f"expected={expected_dim}). Deleting. Repo: {repo_url}"
+                        )
+                        self._client.delete_collection(name=collection.name)
+            except Exception:
+                continue
 
     def _load_repo_meta(self, repo_url: str) -> dict:
         """Load per-repo metadata from JSON file."""
@@ -105,9 +156,36 @@ class ChromaStore:
         embeddings: list[list[float]],
         metadatas: list[dict],
     ) -> None:
-        """Add chunks to the collection. Each chunk gets a unique ID for updates."""
+        """Add chunks to the collection. Each chunk gets a unique ID for updates.
+        
+        Handles dimension mismatch: if the collection was created with a different
+        embedding dimension (e.g., switched from all-MiniLM-L6-v2 to nomic-embed-text),
+        the old collection is deleted and recreated.
+        """
         collection = self._get_collection(repo_url)
-        # ChromaDB will raise if IDs conflict — use upsert for incremental safety
+        
+        # Check embedding dimension matches collection
+        if embeddings:
+            new_dim = len(embeddings[0])
+            # Peek at existing data to check dimension
+            existing_count = collection.count()
+            if existing_count > 0:
+                try:
+                    peek = collection.peek(limit=1)
+                    existing_embs = peek.get("embeddings", [[]])
+                    if existing_embs and existing_embs[0]:
+                        existing_dim = len(existing_embs[0])
+                        if existing_dim != new_dim:
+                            logger.warning(
+                                f"Collection dimension mismatch: existing={existing_dim}, new={new_dim}. "
+                                f"Recreating collection for {repo_url}"
+                            )
+                            # Delete old collection and create fresh
+                            self.delete_collection(repo_url)
+                            collection = self._get_collection(repo_url)
+                except Exception:
+                    pass  # If peek fails, try upsert anyway
+        
         collection.upsert(
             ids=chunk_ids,
             documents=documents,
@@ -146,9 +224,29 @@ class ChromaStore:
     ) -> dict:
         """Query for similar chunks. Returns documents, metadatas, distances."""
         collection = self._get_collection(repo_url)
+        
+        # Check dimension match
+        existing_count = collection.count()
+        if existing_count > 0:
+            try:
+                peek = collection.peek(limit=1)
+                existing_embs = peek.get("embeddings", [[]])
+                if existing_embs and existing_embs[0]:
+                    existing_dim = len(existing_embs[0])
+                    query_dim = len(query_embedding)
+                    if existing_dim != query_dim:
+                        logger.warning(
+                            f"Query dimension mismatch: collection={existing_dim}, query={query_dim}. "
+                            f"Clearing stale collection."
+                        )
+                        self.delete_collection(repo_url)
+                        collection = self._get_collection(repo_url)
+            except Exception:
+                pass
+        
         kwargs = {
             "query_embeddings": [query_embedding],
-            "n_results": n_results,
+            "n_results": min(n_results, max(collection.count(), 1)),
             "include": ["documents", "metadatas", "distances"],
         }
         if where:

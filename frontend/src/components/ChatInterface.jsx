@@ -30,7 +30,7 @@ function backendErrorMessage(status) {
   return `Server error (HTTP ${status})`;
 }
 
-export default function ChatInterface({ repoUrl }) {
+export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
@@ -39,6 +39,27 @@ export default function ChatInterface({ repoUrl }) {
   const [llmStarters, setLlmStarters] = useState(null);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
+  const messagesRef = useRef([]);
+
+  // Keep messagesRef in sync
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  // Handle "Ask about file" from FileTree
+  useEffect(() => {
+    if (askAboutFile && askAboutFile.path && !streaming) {
+      const q = `Explain what ${askAboutFile.path} does and how it works`;
+      setInput(q);
+      inputRef.current?.focus();
+      // Auto-send after a brief moment
+      setTimeout(() => {
+        if (inputRef.current) {
+          const form = inputRef.current.closest('form');
+          if (form) form.requestSubmit();
+        }
+      }, 100);
+      onAskHandled?.();
+    }
+  }, [askAboutFile]);
 
   // Fetch dynamic starters
   useEffect(() => {
@@ -77,12 +98,25 @@ export default function ChatInterface({ repoUrl }) {
       { id: aid, role: 'assistant', content: '', sources: [], streaming: true },
     ]);
 
+    // Build conversation history from previous messages (last 4 Q&A pairs)
+    const history = [];
+    const completedMsgs = messagesRef.current.filter(m => !m.streaming && m.content);
+    for (let i = 0; i < completedMsgs.length; i++) {
+      const m = completedMsgs[i];
+      if (m.role === 'user' && i + 1 < completedMsgs.length && completedMsgs[i + 1].role === 'assistant') {
+        history.push({
+          question: m.content,
+          answer: completedMsgs[i + 1].content.slice(0, 500),
+        });
+      }
+    }
+
     let res;
     try {
       res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo_url: repoUrl, question: q }),
+        body: JSON.stringify({ repo_url: repoUrl, question: q, history: history.slice(-4) }),
       });
     } catch (err) {
       setMessages(prev => prev.map(m =>
@@ -199,6 +233,11 @@ export default function ChatInterface({ repoUrl }) {
                   ) : (msg.streaming ? <span className="cursor">▍</span> : '')
                 )}
               </div>
+              {msg.role === 'assistant' && !msg.streaming && msg.content && (
+                <button className="copy-answer-btn" onClick={() => navigator.clipboard?.writeText(msg.content)} title="Copy answer">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25v-7.5z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25v-7.5zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25h-7.5z"/></svg>
+                </button>
+              )}
             </div>
           </div>
         ))}

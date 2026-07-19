@@ -3,6 +3,8 @@ import RepoInput from './components/RepoInput';
 import IndexingProgress from './components/IndexingProgress';
 import ChatInterface from './components/ChatInterface';
 import PixelBlast from './components/PixelBlast';
+import FileTree from './components/FileTree';
+import RepoSummary from './components/RepoSummary';
 import './styles/index.css';
 
 export default function App() {
@@ -13,6 +15,9 @@ export default function App() {
   const [backendOk, setBackendOk] = useState(null);
   const [gitAvailable, setGitAvailable] = useState(true);
   const [keepData, setKeepData] = useState(false);
+  const [showTree, setShowTree] = useState(false);
+  const [showSummary, setShowSummary] = useState(false);
+  const [askAboutFile, setAskAboutFile] = useState(null);
   const cleanupRef = useRef(false);
 
   useEffect(() => {
@@ -127,6 +132,14 @@ export default function App() {
         <div className="header-right">
           {state === 'indexed' && (
             <>
+              <button className={`btn-ghost ${showTree ? 'btn-ghost-active' : ''}`} onClick={() => setShowTree(v => !v)} title="Toggle file tree">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M1 3a1 1 0 011-1h4a1 1 0 011 1v1h7a1 1 0 011 1v8a1 1 0 01-1 1H2a1 1 0 01-1-1V3z"/></svg>
+                <span>Files</span>
+              </button>
+              <button className={`btn-ghost ${showSummary ? 'btn-ghost-active' : ''}`} onClick={() => setShowSummary(v => !v)} title="Repo overview">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="3" r="1.5"/><circle cx="3" cy="13" r="1.5"/><circle cx="13" cy="13" r="1.5"/><path d="M8 4.5v4l5 3.5M8 8.5L3 12" stroke="currentColor" fill="none" strokeWidth="1.2"/></svg>
+                <span>Overview</span>
+              </button>
               <label className="keep-toggle" title="Keep repo data on disk after you leave">
                 <input
                   type="checkbox"
@@ -186,7 +199,23 @@ export default function App() {
                 {indexedInfo?.files_indexed} files · {indexedInfo?.chunks_created} chunks · {indexedInfo?.time_seconds}s
               </span>
             </div>
-            <ChatInterface repoUrl={repoUrl} />
+            <div className="chat-layout">
+              {showTree && (
+                <FileTree
+                  repoUrl={repoUrl}
+                  onFileClick={(node) => setAskAboutFile(node)}
+                  onClose={() => setShowTree(false)}
+                />
+              )}
+              {showSummary && (
+                <RepoSummary
+                  repoUrl={repoUrl}
+                  filesInfo={indexedInfo}
+                  onClose={() => setShowSummary(false)}
+                />
+              )}
+              <ChatInterface repoUrl={repoUrl} askAboutFile={askAboutFile} onAskHandled={() => setAskAboutFile(null)} />
+            </div>
           </div>
         )}
       </main>

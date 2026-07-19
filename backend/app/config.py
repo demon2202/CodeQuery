@@ -9,8 +9,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = Path(os.getenv("CQ_DATA_DIR", str(BASE_DIR / "data")))
 REPOS_DIR = DATA_DIR / "repos"
 CHROMA_DIR = DATA_DIR / "chromadb"
+SNAPSHOT_DIR = DATA_DIR / "snapshots"
 REPOS_DIR.mkdir(parents=True, exist_ok=True)
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Ollama — qwen2.5-coder:7b for generation, nomic-embed-text for embeddings.
 OLLAMA_BASE_URL = os.getenv("CQ_OLLAMA_URL", "http://localhost:11434")
@@ -46,18 +48,11 @@ RETRIEVAL_TOP_K = int(os.getenv("CQ_RETRIEVAL_TOP_K", "12"))
 # 0.25 works well. Auto-adjusted based on provider in search.py if not overridden.
 RETRIEVAL_MIN_SCORE = float(os.getenv("CQ_RETRIEVAL_MIN_SCORE", "0.10"))
 
-# Parallel parsing workers
-PARSE_WORKERS = int(os.getenv("CQ_PARSE_WORKERS", "4"))
-
 # ChromaDB HNSW
 CHROMA_HNSW_SPACE = "cosine"
 CHROMA_HNSW_M = int(os.getenv("CQ_HNSW_M", "16"))
 CHROMA_HNSW_EF_CONSTRUCTION = int(os.getenv("CQ_HNSW_EF_CONSTRUCTION", "100"))
 CHROMA_HNSW_EF_SEARCH = int(os.getenv("CQ_HNSW_EF_SEARCH", "50"))
-
-# Server
-HOST = os.getenv("CQ_HOST", "0.0.0.0")
-PORT = int(os.getenv("CQ_PORT", "8000"))
 
 # File filtering
 SKIP_DIRS = {
@@ -82,6 +77,9 @@ TEXT_EXTENSIONS = {
     ".json", ".json5", ".jsonc",
     ".md", ".rst", ".txt",
 }
+
+# Pre-computed set of all source file extensions (dict keys + set merged)
+ALL_SOURCE_EXTENSIONS = set(AST_EXTENSIONS.keys()) | TEXT_EXTENSIONS
 
 SKIP_EXTENSIONS = {
     ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe", ".bin",
