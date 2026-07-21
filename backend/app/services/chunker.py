@@ -218,8 +218,6 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
 
     # Track where the last structural node ended
     last_end = 0
-    # Track where module-level code starts (before first function/class)
-    module_code_start = 0
     first_structural_found = False
 
     for child in tree.root_node.children:

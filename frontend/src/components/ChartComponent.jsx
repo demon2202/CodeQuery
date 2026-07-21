@@ -21,12 +21,6 @@ const PALETTE = [
   '#fb923c', '#38bdf8', '#4ade80', '#e879f9', '#f472b6',
 ];
 
-const DARK_CHART_DEFAULTS = {
-  color: '#999999',
-  borderColor: '#2a2a2a',
-  backgroundColor: 'transparent',
-};
-
 export default function ChartComponent({ spec }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
