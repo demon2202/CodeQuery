@@ -14,6 +14,11 @@ REPOS_DIR.mkdir(parents=True, exist_ok=True)
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
+# LLM Provider: "ollama" or "groq"
+LLM_PROVIDER = os.getenv("CQ_LLM_PROVIDER", "ollama")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("CQ_GROQ_MODEL", "llama-3.3-70b-versatile")
+
 # Ollama — qwen2.5-coder:7b for generation, nomic-embed-text for embeddings.
 OLLAMA_BASE_URL = os.getenv("CQ_OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("CQ_OLLAMA_MODEL", "qwen2.5-coder:7b")

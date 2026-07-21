@@ -279,9 +279,64 @@ async def generate_answer(
         history_section=history_section,
     )
 
-    # Call Ollama streaming API
+    # Call LLM (Groq or Ollama)
     full_answer = []
 
+    if config.LLM_PROVIDER == "groq" or (config.GROQ_API_KEY and config.LLM_PROVIDER != "ollama"):
+        headers = {
+            "Authorization": f"Bearer {config.GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": config.GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "stream": True,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST",
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                ) as response:
+                    if response.status_code != 200:
+                        error_body = await response.aread()
+                        yield {
+                            "type": "error",
+                            "message": f"Groq API error {response.status_code}: {error_body.decode()[:200]}",
+                        }
+                        return
+
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        if line.startswith("data: "):
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                delta = data["choices"][0]["delta"].get("content", "")
+                                if delta:
+                                    full_answer.append(delta)
+                                    yield {"type": "token", "text": delta}
+                            except Exception:
+                                continue
+            yield {"type": "done", "answer": "".join(full_answer)}
+            return
+        except Exception as e:
+            yield {
+                "type": "error",
+                "message": f"Groq generation failed: {e}",
+            }
+            return
+
+    # Call Ollama streaming API
     try:
         async with httpx.AsyncClient(timeout=config.OLLAMA_TIMEOUT) as client:
             async with client.stream(
@@ -346,7 +401,12 @@ async def generate_answer(
 
 
 async def check_ollama_health() -> dict:
-    """Check if Ollama is running and the model is available."""
+    """Check if LLM provider (Ollama or Groq) is ready."""
+    if config.LLM_PROVIDER == "groq" or (config.GROQ_API_KEY and config.LLM_PROVIDER != "ollama"):
+        if config.GROQ_API_KEY:
+            return {"running": True, "model_available": True, "provider": "groq", "models": [config.GROQ_MODEL]}
+        return {"running": False, "model_available": False, "error": "GROQ_API_KEY is not set"}
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{config.OLLAMA_BASE_URL}/api/tags")
@@ -386,7 +446,11 @@ async def check_ollama_health() -> dict:
 
 
 async def warm_up_model() -> None:
-    """Send a warm-up request to Ollama so the model stays loaded."""
+    """Warm up LLM model."""
+    if config.LLM_PROVIDER == "groq" or (config.GROQ_API_KEY and config.LLM_PROVIDER != "ollama"):
+        logger.info(f"Using Groq API model: {config.GROQ_MODEL}")
+        return
+
     try:
         async with httpx.AsyncClient(timeout=config.OLLAMA_WARMUP_TIMEOUT) as client:
             await client.post(
