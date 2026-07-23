@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import MessageContent from './MessageContent';
+import { API_BASE } from '../config';
 
 export default function RepoSummary({ repoUrl, filesInfo, onClose }) {
   const [summary, setSummary] = useState(null);
@@ -10,7 +11,7 @@ export default function RepoSummary({ repoUrl, filesInfo, onClose }) {
     let cancelled = false;
     const fetchSummary = async () => {
       try {
-        const res = await fetch(`/api/repos/summary?repo_url=${encodeURIComponent(repoUrl)}`);
+        const res = await fetch(`${API_BASE}/api/repos/summary?repo_url=${encodeURIComponent(repoUrl)}`);
         if (!cancelled && res.ok) {
           const data = await res.json();
           setSummary(data);

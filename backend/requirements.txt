@@ -16,6 +16,9 @@ chromadb>=0.4.22         # Persistent vector DB with HNSW backend + metadata fil
 sentence-transformers>=2.5.1  # Loads jina-embeddings-v2-base-code
 numpy>=1.24.0
 
+# ── Hybrid search ────────────────────────────────────────────────────────────
+rank-bm25>=0.2.2          # Keyword search, fused with vector search via RRF
+
 # ── AST parsing ──────────────────────────────────────────────────────────────
 tree-sitter>=0.22.0           # Core tree-sitter library
 tree-sitter-python>=0.21.0    # Python grammar

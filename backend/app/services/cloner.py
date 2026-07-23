@@ -87,6 +87,18 @@ async def check_git_available() -> str:
         )
 
 
+def _dir_size_mb(path: Path) -> float:
+    """Total size of a directory in MB, following regular files only."""
+    total = 0
+    for f in path.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    return total / (1024 * 1024)
+
+
 async def clone_repo(repo_url: str) -> Tuple[Path, str]:
     """Clone a repo (shallow) or update if already exists.
     Returns (repo_path, commit_hash). Raises on failure.
@@ -160,6 +172,17 @@ async def clone_repo(repo_url: str) -> Tuple[Path, str]:
         logger.error(f"Cloned repo appears empty: {repo_path}")
         shutil.rmtree(repo_path, ignore_errors=True)
         raise RuntimeError("Git clone succeeded but the repo directory is empty. The repository might be empty on GitHub.")
+
+    # Enforce size limit — reject oversized repos to protect disk/CPU on shared hosts
+    size_mb = _dir_size_mb(repo_path)
+    if size_mb > config.MAX_REPO_SIZE_MB:
+        logger.warning(f"Repo {repo_url} is {size_mb:.0f}MB, exceeds limit of {config.MAX_REPO_SIZE_MB}MB. Rejecting.")
+        shutil.rmtree(repo_path, ignore_errors=True)
+        raise RuntimeError(
+            f"Repository is too large ({size_mb:.0f}MB, even shallow-cloned). "
+            f"This deployment supports repos up to {config.MAX_REPO_SIZE_MB}MB. "
+            f"Try a smaller repo or a specific subdirectory's repo."
+        )
 
     return repo_path, commit_hash
 

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { API_BASE } from '../config';
 
 const LANG_ICONS = {
   python: '🐍', javascript: 'JS', typescript: 'TS', go: 'Go',
@@ -16,7 +17,7 @@ export default function FileTree({ repoUrl, onFileClick, onClose }) {
     let cancelled = false;
     const fetchTree = async () => {
       try {
-        const res = await fetch(`/api/repos/tree?repo_url=${encodeURIComponent(repoUrl)}`);
+        const res = await fetch(`${API_BASE}/api/repos/tree?repo_url=${encodeURIComponent(repoUrl)}`);
         if (!cancelled && res.ok) {
           const data = await res.json();
           setTree(data);

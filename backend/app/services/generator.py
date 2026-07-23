@@ -35,6 +35,7 @@ SYSTEM_PROMPT = """You are CodeQuery, an expert code analyst. You answer questio
 2. If chunks don't fully answer the question, state what you CAN determine, then say "I don't have enough context to determine [specific thing]."
 3. NEVER dump all citations at the top of your answer. Integrate citations naturally inline where they're relevant.
 4. NEVER dump an entire code chunk verbatim. Extract and show only the relevant lines/snippets.
+5. Some chunks are marked "PART X/Y OF THE SAME FUNCTION/MODULE, NOT A SEPARATE ONE" — this means the chunk was split only because it was too long to store as one piece. Treat all parts together as ONE single function/module and describe it as a single unit. NEVER write a "Synthesis of X_p1 and X_p2" section, never treat parts as separate functions being compared or merged — just read them in order as one continuous piece of code.
 
 ## CITATION FORMAT
 
@@ -198,6 +199,17 @@ def _format_chunks_for_prompt(sources: List[ChunkSource], documents: List[str]) 
 
     parts = []
 
+    # Detect continuation pieces: same file + same name + same chunk_type
+    # appearing more than once means one function/module block got split
+    # across multiple chunks purely for storage size limits. Track counts
+    # so we can label them "part X of Y" instead of letting the LLM think
+    # they're separate functions.
+    key_counts: dict[tuple, int] = {}
+    for s in sources:
+        key = (s.file_path, s.name, s.chunk_type)
+        key_counts[key] = key_counts.get(key, 0) + 1
+    key_seen: dict[tuple, int] = {}
+
     # File overview — helps the LLM understand the repo structure
     if file_set:
         sorted_files = sorted(file_set)
@@ -205,35 +217,46 @@ def _format_chunks_for_prompt(sources: List[ChunkSource], documents: List[str]) 
         for f in sorted_files:
             chunks_in_file = [s for s in sources if s.file_path == f]
             names = []
+            seen_names = set()
             for c in chunks_in_file:
                 if c.chunk_type == "class":
-                    names.append(f"class {c.name}")
+                    label = f"class {c.name}"
                 elif c.chunk_type == "function":
-                    names.append(f"fn {c.name}")
+                    label = f"fn {c.name}"
                 elif c.chunk_type == "method":
                     parent = c.parent or ""
-                    names.append(f"fn {parent}.{c.name}")
+                    label = f"fn {parent}.{c.name}"
                 elif c.chunk_type == "module":
-                    names.append("module-level")
+                    label = "module-level"
                 else:
-                    names.append(f"{c.chunk_type} {c.name}")
+                    label = f"{c.chunk_type} {c.name}"
+                if label not in seen_names:
+                    names.append(label)
+                    seen_names.add(label)
             parts.append(f"  {f}: {', '.join(names)}")
         parts.append("")
 
     # Individual chunks with clear headers
     for i, (source, doc) in enumerate(zip(sources, documents)):
         location = f"{source.file_path}:{source.start_line}-{source.end_line}"
+        key = (source.file_path, source.name, source.chunk_type)
+        total_parts = key_counts[key]
+        key_seen[key] = key_seen.get(key, 0) + 1
+        part_num = key_seen[key]
+        continuation_note = ""
+        if total_parts > 1:
+            continuation_note = f" — PART {part_num}/{total_parts} OF THE SAME {source.chunk_type.upper()}, NOT A SEPARATE ONE"
 
         if source.chunk_type == "class":
-            header = f"[{i+1}] class {source.name} ({location})"
+            header = f"[{i+1}] class {source.name} ({location}){continuation_note}"
         elif source.chunk_type == "method":
-            header = f"[{i+1}] {source.parent}.{source.name}() ({location})"
+            header = f"[{i+1}] {source.parent}.{source.name}() ({location}){continuation_note}"
         elif source.chunk_type == "function":
-            header = f"[{i+1}] {source.name}() ({location})"
+            header = f"[{i+1}] {source.name}() ({location}){continuation_note}"
         elif source.chunk_type == "module":
-            header = f"[{i+1}] module-level code ({location})"
+            header = f"[{i+1}] module-level code ({location}){continuation_note}"
         else:
-            header = f"[{i+1}] {source.name} ({location})"
+            header = f"[{i+1}] {source.name} ({location}){continuation_note}"
 
         parts.append(f"{header}\n```{source.language}\n{doc}\n```")
 
@@ -245,6 +268,7 @@ async def generate_answer(
     sources: List[ChunkSource],
     documents: List[str],
     history: list[dict] | None = None,
+    unmatched_filenames: list[str] | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Generate an answer using Ollama, streaming tokens.
 
@@ -272,12 +296,23 @@ async def generate_answer(
     # Build the prompt
     chunks_text = _format_chunks_for_prompt(sources, documents)
     history_section = _format_history(history)
+
+    unmatched_note = ""
+    if unmatched_filenames:
+        unmatched_note = (
+            f"\n\nIMPORTANT: the question mentions {', '.join(unmatched_filenames)}, but no file "
+            f"matching that name exists anywhere in this indexed repository (confirmed by exact "
+            f"filename search, not just semantic search). Do NOT describe what that file "
+            f"probably contains based on general/training knowledge of typical projects. "
+            f"Explicitly tell the user this file was not found in the indexed repo."
+        )
+
     prompt = CHUNK_PROMPT_TEMPLATE.format(
         count=len(sources),
         chunks=chunks_text,
         question=question,
         history_section=history_section,
-    )
+    ) + unmatched_note
 
     # Call LLM (Groq or Ollama)
     full_answer = []

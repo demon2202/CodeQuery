@@ -4,6 +4,7 @@ import IndexingProgress from './components/IndexingProgress';
 import ChatInterface from './components/ChatInterface';
 import PixelBlast from './components/PixelBlast';
 import FileTree from './components/FileTree';
+import { API_BASE } from './config';
 import RepoSummary from './components/RepoSummary';
 import './styles/index.css';
 
@@ -20,11 +21,42 @@ export default function App() {
   const [askAboutFile, setAskAboutFile] = useState(null);
   const cleanupRef = useRef(false);
 
+  // Refs so the pagehide handler always sees current values without
+  // re-attaching the listener on every state change.
+  const repoUrlRef = useRef(repoUrl);
+  const keepDataRef = useRef(keepData);
+  const stateRef = useRef(state);
+  useEffect(() => { repoUrlRef.current = repoUrl; }, [repoUrl]);
+  useEffect(() => { keepDataRef.current = keepData; }, [keepData]);
+  useEffect(() => { stateRef.current = state; }, [state]);
+
+  // Auto-cleanup on tab close / navigation away — otherwise a repo you were
+  // just looking at (indexed or mid-index) sits in ChromaDB/snapshot storage
+  // forever unless you explicitly clicked "New repo". `keepalive: true` lets
+  // this fetch survive the page unload in modern browsers.
+  useEffect(() => {
+    const handlePageHide = () => {
+      const url = repoUrlRef.current;
+      const keep = keepDataRef.current;
+      const currentState = stateRef.current;
+      if (!url || keep) return;
+      if (currentState !== 'indexed' && currentState !== 'indexing') return;
+      try {
+        fetch(`${API_BASE}/api/repos/index?repo_url=${encodeURIComponent(url)}&delete_files=true`, {
+          method: 'DELETE',
+          keepalive: true,
+        });
+      } catch {}
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    return () => window.removeEventListener('pagehide', handlePageHide);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     const check = async () => {
       try {
-        const res = await fetch('/api/chat/health');
+        const res = await fetch(`${API_BASE}/api/chat/health`);
         if (!cancelled) {
           if (res.ok) {
             const data = await res.json();
@@ -52,7 +84,7 @@ export default function App() {
     if (repoUrl && !keepData && !cleanupRef.current) {
       cleanupRef.current = true;
       try {
-        await fetch(`/api/repos/index?repo_url=${encodeURIComponent(repoUrl)}&delete_files=true`, {
+        await fetch(`${API_BASE}/api/repos/index?repo_url=${encodeURIComponent(repoUrl)}&delete_files=true`, {
           method: 'DELETE',
         });
       } catch {}
@@ -75,11 +107,20 @@ export default function App() {
     }
   }, []);
 
+  // IndexingProgress already aborted the request and deleted any partially
+  // created data before calling this — just reset the view.
+  const handleCancelIndexing = useCallback(() => {
+    setState('idle');
+    setRepoUrl('');
+    setError(null);
+    setIndexedInfo(null);
+  }, []);
+
   const handleReset = useCallback(async () => {
     // If keepData is off, delete the repo's index + files
     if (repoUrl && !keepData) {
       try {
-        await fetch(`/api/repos/index?repo_url=${encodeURIComponent(repoUrl)}&delete_files=true`, {
+        await fetch(`${API_BASE}/api/repos/index?repo_url=${encodeURIComponent(repoUrl)}&delete_files=true`, {
           method: 'DELETE',
         });
       } catch {}
@@ -176,6 +217,7 @@ export default function App() {
           <IndexingProgress
             repoUrl={repoUrl}
             onProgress={handleProgress}
+            onCancel={handleCancelIndexing}
           />
         )}
 

@@ -215,6 +215,23 @@ class ChromaStore:
             meta_path.unlink()
         self._repo_meta.pop(repo_url, None)
 
+    def get_all_chunks(self, repo_url: str) -> dict:
+        """Fetch every chunk's id/document/metadata for a repo.
+
+        Used to build the BM25 keyword index. Cheap for typical repo sizes
+        (a few thousand chunks); ChromaDB's get() with no `where` filter
+        returns everything in one call.
+        """
+        collection = self._get_collection(repo_url)
+        if collection.count() == 0:
+            return {"ids": [], "documents": [], "metadatas": []}
+        result = collection.get(include=["documents", "metadatas"])
+        return {
+            "ids": result.get("ids", []),
+            "documents": result.get("documents", []),
+            "metadatas": result.get("metadatas", []),
+        }
+
     def query(
         self,
         repo_url: str,

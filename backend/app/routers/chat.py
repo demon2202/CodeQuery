@@ -17,6 +17,7 @@ from ..services.search import search_cached, search
 from ..services.generator import generate_answer, check_ollama_health
 from ..services.cloner import check_git_available, get_repo_path
 from ..services.snapshot import get_dir_names, get_all_file_paths
+from ..services import query_rewrite
 from ..store.chroma_store import get_store
 
 logger = logging.getLogger(__name__)
@@ -229,14 +230,30 @@ async def chat(request: ChatRequest):
 
     async def event_stream():
         try:
-            sources, documents, _ = search_cached(
+            # Retrieval uses a context-aware query (folds in the previous turn
+            # so follow-ups like "where's the token refreshed" retrieve
+            # correctly). The LLM still gets the original, unmodified question.
+            if config.QUERY_REWRITE_LLM_ENABLED:
+                search_query = await query_rewrite.llm_rewrite_query(request.question, request.history)
+            else:
+                search_query = query_rewrite.contextual_query(request.question, request.history)
+
+            sources, documents, _, unmatched_filenames = search_cached(
                 repo_url=request.repo_url,
-                question=request.question,
+                question=search_query,
             )
 
             if not sources:
+                if unmatched_filenames:
+                    msg = (
+                        f"I couldn't find a file matching {', '.join(unmatched_filenames)} "
+                        f"in this indexed repository. It may not exist, may be in a different "
+                        f"location, or may have been filtered out during indexing."
+                    )
+                else:
+                    msg = "I could not find relevant code for that question. Try rephrasing or asking about a different part of the codebase."
                 yield f"data: {json.dumps({'type': 'sources', 'chunks': []})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'answer': 'I could not find relevant code for that question. Try rephrasing or asking about a different part of the codebase.'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'answer': msg})}\n\n"
                 return
 
             async for event in generate_answer(
@@ -244,6 +261,7 @@ async def chat(request: ChatRequest):
                 sources=sources,
                 documents=documents,
                 history=request.history,
+                unmatched_filenames=unmatched_filenames,
             ):
                 yield f"data: {json.dumps(event)}\n\n"
 
@@ -291,7 +309,7 @@ async def debug_search(
 ):
     """Debug endpoint — shows raw search scores."""
     try:
-        sources, documents, search_time = search(repo_url, question)
+        sources, documents, search_time, unmatched_filenames = search(repo_url, question)
         return {
             "question": question,
             "repo_url": repo_url,
@@ -299,6 +317,7 @@ async def debug_search(
             "num_results": len(sources),
             "min_score_threshold": config.RETRIEVAL_MIN_SCORE,
             "top_k": config.RETRIEVAL_TOP_K,
+            "unmatched_filenames": unmatched_filenames,
             "results": [
                 {
                     "file_path": s.file_path,

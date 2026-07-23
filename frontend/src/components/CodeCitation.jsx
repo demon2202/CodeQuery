@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { API_BASE } from '../config';
 
 export default function CodeCitation({ citation, repoUrl, onClose }) {
   const [code, setCode] = useState('');
@@ -18,7 +19,7 @@ export default function CodeCitation({ citation, repoUrl, onClose }) {
           start_line: String(citation.start_line),
           end_line: String(citation.end_line),
         });
-        const res = await fetch(`/api/repos/file?${params}`);
+        const res = await fetch(`${API_BASE}/api/repos/file?${params}`);
         if (!res.ok) throw new Error(res.statusText);
         const data = await res.json();
         if (!cancelled) {

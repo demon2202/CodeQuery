@@ -237,7 +237,15 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
     all_embeddings: list[list[float]] = []
 
     for i in range(0, total_chunks, EMBED_BATCH_SIZE):
-        batch = [c.content for c in all_chunks[i : i + EMBED_BATCH_SIZE]]
+        chunk_batch = all_chunks[i : i + EMBED_BATCH_SIZE]
+        # Embed filename + content together, not content alone. Filenames are
+        # never otherwise part of the searchable text, so a question like
+        # "how does package.json manage dependencies" has zero lexical/semantic
+        # anchor to the actual package.json chunk — only to whichever chunk
+        # happens to share generic words like "dependencies". The file_path
+        # prefix here is embedding-only; the stored/displayed document text
+        # (below, at storage time) stays as pure chunk.content.
+        batch = [f"{c.file_path}\n{c.content}" for c in chunk_batch]
         try:
             embeddings = await loop.run_in_executor(None, encode_batch, batch)
             all_embeddings.extend(embeddings)

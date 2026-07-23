@@ -34,12 +34,22 @@ EMBEDDING_PROVIDER = os.getenv("CQ_EMBEDDING_PROVIDER", "ollama")
 # Run: ollama pull nomic-embed-text
 OLLAMA_EMBED_MODEL = os.getenv("CQ_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
-# Sentence-transformers model (used when EMBEDDING_PROVIDER=sentence-transformers)
-# WARNING: all-MiniLM-L6-v2 is a general sentence model — poor at code retrieval.
-# It produces similarity scores of 0.15-0.20 for code Q&A, barely above noise.
-# Use Ollama embeddings instead if possible.
-EMBEDDING_MODEL = os.getenv("CQ_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-EMBEDDING_BATCH_SIZE = int(os.getenv("CQ_EMBEDDING_BATCH_SIZE", "64"))
+# Sentence-transformers model (used when EMBEDDING_PROVIDER=sentence-transformers,
+# i.e. whenever Ollama isn't reachable — this is the path used on Render/free hosts).
+#
+# jina-embeddings-v2-base-code is code-aware and meaningfully better at this task
+# than a general sentence model. IMPORTANT CAVEAT: it's a ~322M-param model
+# (~1.3GB in memory), much heavier than all-MiniLM-L6-v2 (~22M params). On a
+# memory-constrained free-tier host this may be slow to load or OOM. Test it on
+# your actual deployment before relying on it — if it fails, set
+# CQ_EMBEDDING_MODEL=all-MiniLM-L6-v2 to revert, or try a smaller general model
+# as a middle ground (e.g. BAAI/bge-small-en-v1.5, 33M params, not code-specific
+# but still better than nothing).
+EMBEDDING_MODEL = os.getenv("CQ_EMBEDDING_MODEL", "jina-embeddings-v2-base-code")
+
+# Smaller batches for the heavier jina model to reduce peak memory on CPU.
+_default_batch_size = "16" if "jina" in EMBEDDING_MODEL.lower() else "64"
+EMBEDDING_BATCH_SIZE = int(os.getenv("CQ_EMBEDDING_BATCH_SIZE", _default_batch_size))
 
 # Chunking
 MAX_CHUNK_CHARS = int(os.getenv("CQ_MAX_CHUNK_CHARS", "2000"))
@@ -48,10 +58,59 @@ SLIDING_WINDOW_OVERLAP = int(os.getenv("CQ_SLIDING_WINDOW_OVERLAP", "10"))
 
 # Retrieval
 RETRIEVAL_TOP_K = int(os.getenv("CQ_RETRIEVAL_TOP_K", "12"))
-# Minimum similarity score. all-MiniLM-L6-v2 produces 0.15-0.20 for code queries,
-# so 0.10 is needed. nomic-embed-text produces 0.40-0.70 for good matches, so
-# 0.25 works well. Auto-adjusted based on provider in search.py if not overridden.
-RETRIEVAL_MIN_SCORE = float(os.getenv("CQ_RETRIEVAL_MIN_SCORE", "0.10"))
+
+# Minimum similarity score to keep a vector-search result. Different embedding
+# models produce very different similarity ranges for the same content, so this
+# auto-adjusts based on which model is active — UNLESS you set
+# CQ_RETRIEVAL_MIN_SCORE explicitly, which always wins.
+#
+# These per-model numbers are reasonable starting points, not measured ground
+# truth for your specific repos. If retrieval feels too strict/loose, hit
+# GET /api/chat/debug/search to see real similarity scores for your queries
+# and tune CQ_RETRIEVAL_MIN_SCORE from there.
+if os.getenv("CQ_RETRIEVAL_MIN_SCORE") is not None:
+    RETRIEVAL_MIN_SCORE = float(os.getenv("CQ_RETRIEVAL_MIN_SCORE"))
+elif EMBEDDING_PROVIDER == "ollama":
+    RETRIEVAL_MIN_SCORE = 0.25  # nomic-embed-text typically scores 0.40-0.70 on good matches
+elif "jina" in EMBEDDING_MODEL.lower():
+    RETRIEVAL_MIN_SCORE = 0.30  # estimate — verify via /api/chat/debug/search
+else:
+    RETRIEVAL_MIN_SCORE = 0.10  # all-MiniLM-L6-v2 and similar general models
+
+# Hybrid search — BM25 keyword search fused with vector search via Reciprocal
+# Rank Fusion. Fixes cases where embeddings miss exact identifier matches
+# (e.g. "what does handleSubmit do"). Pure Python, no extra model, cheap to
+# leave on. Falls back to vector-only automatically if rank_bm25 isn't installed.
+HYBRID_SEARCH_ENABLED = os.getenv("CQ_HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+HYBRID_CANDIDATE_MULTIPLIER = int(os.getenv("CQ_HYBRID_CANDIDATE_MULTIPLIER", "3"))
+RRF_K = int(os.getenv("CQ_RRF_K", "60"))
+
+# Cross-encoder reranking — extra precision pass on the fused candidates.
+# Off by default: it loads a second small transformer model into memory,
+# which matters on memory-constrained hosts (e.g. Render free tier already
+# runs one embedding model). Turn on with CQ_RERANK_ENABLED=true if you have
+# the headroom — it noticeably improves ranking quality.
+RERANK_ENABLED = os.getenv("CQ_RERANK_ENABLED", "false").lower() == "true"
+RERANK_MODEL = os.getenv("CQ_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# Multi-turn contextual search — folds the previous turn's question into the
+# search query (not the generation prompt) so follow-ups like "where's the
+# token refreshed" after "explain the auth flow" can actually retrieve
+# auth-related chunks instead of searching for "token refreshed" in isolation.
+# Cheap (no extra LLM call) and on by default.
+CONTEXTUAL_SEARCH_ENABLED = os.getenv("CQ_CONTEXTUAL_SEARCH_ENABLED", "true").lower() == "true"
+
+# Optional LLM-based query rewriting — asks the LLM to turn the raw question
+# (+ history) into a better standalone search query before retrieval. More
+# thorough than the heuristic above, but costs one extra LLM round-trip per
+# question, so it's off by default.
+QUERY_REWRITE_LLM_ENABLED = os.getenv("CQ_QUERY_REWRITE_LLM_ENABLED", "false").lower() == "true"
+
+# Repo indexing limits — a public /api/repos/index endpoint with no limits is
+# an open door to disk/CPU exhaustion (anyone can point it at a huge repo).
+MAX_REPO_SIZE_MB = int(os.getenv("CQ_MAX_REPO_SIZE_MB", "300"))
+INDEX_RATE_LIMIT_PER_MIN = int(os.getenv("CQ_INDEX_RATE_LIMIT_PER_MIN", "3"))
+INDEX_RATE_LIMIT_ENABLED = os.getenv("CQ_INDEX_RATE_LIMIT_ENABLED", "true").lower() == "true"
 
 # ChromaDB HNSW
 CHROMA_HNSW_SPACE = "cosine"

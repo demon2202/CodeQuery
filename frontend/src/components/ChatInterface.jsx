@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect, lazy, Suspense } from 'react';
+import { API_BASE } from '../config';
 
 const CodeCitation = lazy(() => import('./CodeCitation'));
 const MessageContent = lazy(() => import('./MessageContent'));
@@ -66,7 +67,7 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
     let cancelled = false;
     const fetchStarters = async () => {
       try {
-        const res = await fetch(`/api/chat/starters?repo_url=${encodeURIComponent(repoUrl)}`);
+        const res = await fetch(`${API_BASE}/api/chat/starters?repo_url=${encodeURIComponent(repoUrl)}`);
         if (!cancelled && res.ok) {
           const data = await res.json();
           setStarters(data.starters || []);
@@ -113,7 +114,7 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
 
     let res;
     try {
-      res = await fetch('/api/chat', {
+      res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repo_url: repoUrl, question: q, history: history.slice(-4) }),

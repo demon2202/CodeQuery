@@ -164,6 +164,31 @@ body {
 }
 .btn-ghost:hover { border-color: var(--grey2); color: var(--white); }
 
+/* Cancel / destructive action — deliberately higher-contrast than btn-ghost.
+   btn-ghost is meant to be quiet chrome; a cancel button during a running
+   operation needs to actually be seen, not blend into the toolbar. */
+.btn-cancel {
+  background: rgba(248, 113, 113, 0.08);
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  color: #f87171;
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: var(--sans);
+  font-weight: 600;
+  transition: all 0.15s;
+}
+.btn-cancel:hover {
+  background: rgba(248, 113, 113, 0.16);
+  border-color: #f87171;
+  color: #fca5a5;
+}
+.btn-cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Keep data toggle */
 .keep-toggle {
   display: flex;
@@ -376,6 +401,14 @@ body {
   margin-bottom: 28px;
 }
 .index-title strong { color: var(--white); font-weight: 600; }
+
+.index-footer {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border2);
+}
 
 .spinner {
   width: 18px;

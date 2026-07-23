@@ -16,11 +16,13 @@ read from the filesystem.
 import json
 import logging
 import shutil
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from ..models import IndexRequest, RepoStatus, RepoStatusList, FileContentResponse
@@ -40,6 +42,31 @@ from ..store.chroma_store import get_store
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/repos", tags=["repos"])
 
+# ── Simple in-memory rate limiter for indexing ──────────────────────────────
+# A public "clone + index any GitHub repo" endpoint with no rate limit is an
+# easy way for one client to exhaust disk/CPU on a shared host. This is a
+# basic sliding-window limiter — fine for a single-process deployment (e.g.
+# one Render instance). It resets on restart and doesn't coordinate across
+# multiple processes/workers; if you scale to multiple workers, swap this for
+# a shared store (Redis) instead.
+_index_requests: dict[str, deque] = defaultdict(deque)
+
+
+def _check_rate_limit(client_ip: str) -> None:
+    if not config.INDEX_RATE_LIMIT_ENABLED:
+        return
+    now = time.time()
+    window = _index_requests[client_ip]
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= config.INDEX_RATE_LIMIT_PER_MIN:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {config.INDEX_RATE_LIMIT_PER_MIN} repo indexing "
+                    f"requests per minute. Try again shortly.",
+        )
+    window.append(now)
+
 LANG_MAP = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript",
     ".ts": "typescript", ".tsx": "typescript", ".go": "go",
@@ -51,8 +78,11 @@ LANG_MAP = {
 
 
 @router.post("/index")
-async def index_repository(request: IndexRequest):
+async def index_repository(request: IndexRequest, http_request: Request):
     """Index a repo. Returns SSE stream with real progress."""
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    _check_rate_limit(client_ip)
+
     async def event_stream():
         try:
             async for event in index_repo(request.repo_url):

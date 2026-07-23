@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { API_BASE } from '../config';
 
 const STAGES = [
   { key: 'cloning', label: 'Clone' },
@@ -38,27 +39,34 @@ async function* readSSE(response) {
   }
 }
 
-export default function IndexingProgress({ repoUrl, onProgress }) {
+export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
   const [stage, setStage] = useState('cloning');
   const [current, setCurrent] = useState(0);
   const [total, setTotal] = useState(0);
   const [message, setMessage] = useState('');
   const [log, setLog] = useState([]);
+  const [cancelling, setCancelling] = useState(false);
   const startedRef = useRef(false);
+  const abortRef = useRef(null);
 
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     const startIndexing = async () => {
       let res;
       try {
-        res = await fetch('/api/repos/index', {
+        res = await fetch(`${API_BASE}/api/repos/index`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ repo_url: repoUrl }),
+          signal: controller.signal,
         });
       } catch (err) {
+        if (err.name === 'AbortError') return; // user cancelled — handled by handleCancel
         onProgress({
           type: 'error',
           message: 'Cannot reach the backend server. Is it running?\n\nStart it in another terminal:\n  cd backend\n  uvicorn app.main:app --port 8000',
@@ -101,12 +109,28 @@ export default function IndexingProgress({ repoUrl, onProgress }) {
           }
         }
       } catch (err) {
+        if (err.name === 'AbortError') return; // user cancelled
         onProgress({ type: 'error', message: `Stream error: ${err.message}` });
       }
     };
 
     startIndexing();
+
+    return () => controller.abort();
   }, [repoUrl, onProgress]);
+
+  const handleCancel = async () => {
+    setCancelling(true);
+    abortRef.current?.abort();
+    // Clean up whatever got partially created (clone/snapshot/chroma data)
+    // for this repo — cancelling should leave nothing behind.
+    try {
+      await fetch(`${API_BASE}/api/repos/index?repo_url=${encodeURIComponent(repoUrl)}&delete_files=true`, {
+        method: 'DELETE',
+      });
+    } catch {}
+    onCancel();
+  };
 
   const stageIdx = STAGES.findIndex(s => s.key === stage);
   const pct = total > 0 ? Math.round((current / total) * 100) : 0;
@@ -153,6 +177,12 @@ export default function IndexingProgress({ repoUrl, onProgress }) {
             ))}
           </div>
         )}
+
+        <div className="index-footer">
+          <button className="btn-cancel" onClick={handleCancel} disabled={cancelling}>
+            {cancelling ? 'Cancelling…' : 'Cancel & discard'}
+          </button>
+        </div>
       </div>
     </div>
   );
