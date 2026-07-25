@@ -13,7 +13,9 @@ pydantic>=2.6.0
 chromadb>=0.4.22         # Persistent vector DB with HNSW backend + metadata filtering
 
 # ── Embeddings ───────────────────────────────────────────────────────────────
-sentence-transformers>=2.5.1  # Loads jina-embeddings-v2-base-code
+# sentence-transformers is NOT used because it imports torch at startup which
+# causes OOM on Render free tier (512MB limit exceeded before model even loads).
+fastembed>=0.3.0
 numpy>=1.24.0
 
 # ── Hybrid search ────────────────────────────────────────────────────────────

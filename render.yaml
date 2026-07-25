@@ -9,10 +9,23 @@ services:
     name: codequery-backend
     runtime: python
     rootDir: backend
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install -r requirements.txt &&
+      python -c "
+      import os; os.environ['FASTEMBED_CACHE_DIR']='/opt/render/project/src/.fastembed_cache';
+      from fastembed import TextEmbedding;
+      print('Downloading all-MiniLM-L6-v2 ONNX model...');
+      TextEmbedding('sentence-transformers/all-MiniLM-L6-v2');
+      print('FastEmbed model cached.')
+      "
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
 
     envVars:
+      # Cache fastembed ONNX models between build and runtime
+      # (fastembed uses onnxruntime — already installed by chromadb — so no torch needed)
+      - key: FASTEMBED_CACHE_DIR
+        value: /opt/render/project/src/.fastembed_cache
+
       # LLM provider — use Groq on Render (Ollama can't run here)
       - key: CQ_LLM_PROVIDER
         value: groq

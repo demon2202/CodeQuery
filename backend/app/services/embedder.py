@@ -2,8 +2,11 @@
 Embedding service for CodeQuery.
 
 Supports two providers:
-1. Ollama (RECOMMENDED) — GPU-accelerated, code-aware models like nomic-embed-text.
-2. sentence-transformers (FALLBACK) — CPU-only, general-purpose models.
+1. Ollama (RECOMMENDED for local use) — GPU-accelerated, code-aware models.
+2. fastembed (DEFAULT for Render/cloud) — ONNX-based, no torch, ~90MB RAM.
+   Uses onnxruntime which is already installed as a chromadb dependency.
+   Replaces sentence-transformers which requires torch (~250MB) and causes
+   OOM on Render free tier.
 
 Handles edge cases: empty strings, overly long texts, batch failures with
 automatic retry with smaller batches.
@@ -205,47 +208,53 @@ def _check_ollama_embed_available() -> bool:
         return False
 
 
-# ── Sentence-Transformers Embedding ───────────────────────────────────
+# ── FastEmbed (ONNX, no torch) ────────────────────────────────────────
+# Uses onnxruntime (already installed as a chromadb dependency).
+# This avoids importing torch (~250MB RAM) and sentence-transformers,
+# which caused OOM kills on Render free tier (512MB limit).
 
 _st_model = None
 
+
 def _get_st_model():
-    """Get or load the sentence-transformers model."""
+    """Get or load the fastembed ONNX model (no torch required)."""
     global _st_model
     if _st_model is None:
-        from sentence_transformers import SentenceTransformer
-        logger.info(f"Loading sentence-transformers model: {config.EMBEDDING_MODEL}...")
-        kwargs = {}
-        if "jina" in config.EMBEDDING_MODEL.lower():
-            kwargs["trust_remote_code"] = True
-        _st_model = SentenceTransformer(config.EMBEDDING_MODEL, **kwargs)
-        logger.info("Sentence-transformers model loaded.")
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            raise RuntimeError(
+                "fastembed is not installed. Run: pip install fastembed\n"
+                "(fastembed replaces sentence-transformers — no torch needed)"
+            )
+        logger.info(f"Loading FastEmbed model: {config.EMBEDDING_MODEL}...")
+        # Use a stable cache dir so model persists between restarts when possible
+        cache_dir = str(config.DATA_DIR / "fastembed_cache")
+        _st_model = TextEmbedding(
+            model_name=config.EMBEDDING_MODEL,
+            cache_dir=cache_dir,
+        )
+        logger.info("FastEmbed model loaded.")
     return _st_model
 
 
 def _st_encode_batch(texts: List[str]) -> List[List[float]]:
-    """Embed a batch using sentence-transformers."""
+    """Embed a batch using fastembed (ONNX, CPU-only, no torch)."""
     import numpy as np
     model = _get_st_model()
-    embeddings = model.encode(
-        texts,
-        batch_size=config.EMBEDDING_BATCH_SIZE,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-    )
-    if isinstance(embeddings, np.ndarray):
-        return embeddings.tolist()
+    clean = [_sanitize_for_embed(t) for t in texts]
+    embeddings = list(model.embed(clean, batch_size=config.EMBEDDING_BATCH_SIZE))
     return [e.tolist() if isinstance(e, np.ndarray) else list(e) for e in embeddings]
 
 
 def _st_encode_single(text: str) -> List[float]:
-    """Embed a single text using sentence-transformers."""
+    """Embed a single text using fastembed."""
     import numpy as np
     model = _get_st_model()
-    embedding = model.encode(text, show_progress_bar=False, normalize_embeddings=True)
-    if isinstance(embedding, np.ndarray):
-        return embedding.tolist()
-    return list(embedding)
+    text = _sanitize_for_embed(text)
+    embeddings = list(model.embed([text]))
+    e = embeddings[0]
+    return e.tolist() if isinstance(e, np.ndarray) else list(e)
 
 
 # ── Unified API ────────────────────────────────────────────────────────
@@ -271,7 +280,7 @@ def _get_provider() -> str:
             logger.warning("Falling back to sentence-transformers (poor code retrieval)")
             _provider = "sentence-transformers"
     else:
-        logger.info(f"Using sentence-transformers embeddings with {config.EMBEDDING_MODEL}")
+        logger.info(f"Using FastEmbed (ONNX) embeddings with {config.EMBEDDING_MODEL}")
         _provider = "sentence-transformers"
 
     return _provider
@@ -288,16 +297,16 @@ def warm_up() -> None:
             logger.info(f"Ollama embeddings ready ({dim}-dim)")
         except Exception as e:
             logger.error(f"Ollama embedding test failed: {e}")
-            logger.warning("Falling back to sentence-transformers")
+            logger.warning("Falling back to FastEmbed (ONNX, no torch)")
             global _provider
             _provider = "sentence-transformers"
             _get_st_model()
             _st_encode_single("warm up")
-            logger.info("Sentence-transformers ready (fallback)")
+            logger.info("FastEmbed ready (fallback from Ollama)")
     else:
         _get_st_model()
         _st_encode_single("warm up")
-        logger.info("Sentence-transformers warmed up")
+        logger.info("FastEmbed (ONNX) warmed up")
 
 
 def encode_batch(texts: List[str]) -> List[List[float]]:
