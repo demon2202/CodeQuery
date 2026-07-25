@@ -97,7 +97,7 @@ _default_origins = (
     "http://127.0.0.1:3000"
 )
 _raw_origins = os.getenv("ALLOWED_ORIGINS", _default_origins)
-ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _raw_origins.split(",") if o.strip()]
 logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
 
 app.add_middleware(

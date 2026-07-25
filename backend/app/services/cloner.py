@@ -229,36 +229,31 @@ async def clone_repo_streaming(repo_url: str):
                 pass
 
     if not (repo_path / ".git").exists():
-        # Fresh shallow clone — stream progress from stderr
+        # Fresh shallow clone.
+        # We use the non-streaming _run_git (communicate-based) instead of
+        # _run_git_streaming because git suppresses --progress output when
+        # stderr is a pipe (not a real TTY), which causes read(256) to block
+        # forever on Windows waiting for bytes that never arrive.
         if repo_path.exists():
             shutil.rmtree(repo_path, ignore_errors=True)
 
-        rc = 0
-        full_stderr = ""
-        full_stdout = ""
+        yield "Cloning repository (may take 30-60s for large repos)..."
 
-        async for item in _run_git_streaming(
-            "git", "clone", "--depth", "1", "--progress", repo_url, str(repo_path)
-        ):
-            if isinstance(item, tuple):
-                # Sentinel: (returncode, stdout, stderr)
-                rc, full_stdout, full_stderr = item
-            else:
-                # Progress line from stderr — forward to caller
-                yield item
+        stdout, stderr, rc = await asyncio.wait_for(
+            _run_git("git", "clone", "--depth", "1", repo_url, str(repo_path)),
+            timeout=300.0,  # 5 min hard limit
+        )
 
         if rc != 0:
             shutil.rmtree(repo_path, ignore_errors=True)
-            # Build a helpful error message
             parts = ["git clone failed"]
-            if full_stderr:
-                parts.append(full_stderr)
-            if full_stdout:
-                parts.append(full_stdout)
+            if stderr:
+                parts.append(stderr)
+            if stdout:
+                parts.append(stdout)
             msg = ": ".join(parts) if len(parts) > 1 else parts[0]
 
-            # Add helpful hints for common failures
-            lower_msg = (full_stderr + " " + full_stdout).lower()
+            lower_msg = (stderr + " " + stdout).lower()
             if "could not resolve" in lower_msg or "network" in lower_msg:
                 msg += "\n\nPossible causes:\n- No internet connection\n- GitHub is unreachable\n- URL is incorrect"
             elif "repository not found" in lower_msg or "not found" in lower_msg:
@@ -269,6 +264,8 @@ async def clone_repo_streaming(repo_url: str):
                 msg += "\n\nNetwork timeout. Try again or check your connection."
 
             raise RuntimeError(msg)
+
+        yield "Clone complete."
 
     # Get current commit hash
     stdout, stderr, rc = await _run_git("git", "rev-parse", "HEAD", cwd=str(repo_path))
