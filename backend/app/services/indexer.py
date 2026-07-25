@@ -19,7 +19,7 @@ from typing import AsyncGenerator
 
 from .. import config
 from ..store.chroma_store import get_store
-from .cloner import clone_repo, get_repo_path, get_changed_files
+from .cloner import clone_repo_streaming, get_repo_path, get_changed_files
 from .walker import walk_source_files
 from .chunker import chunk_file, CodeChunk
 from .embedder import encode_batch
@@ -127,10 +127,17 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
     store = get_store()
     loop = asyncio.get_event_loop()
 
-    # 1. Clone
+    # 1. Clone — stream real-time progress lines from git to the frontend
     yield {"type": "progress", "stage": "cloning", "message": f"Cloning {repo_url}..."}
+    repo_path = None
+    commit_hash = None
     try:
-        repo_path, commit_hash = await clone_repo(repo_url)
+        async for item in clone_repo_streaming(repo_url):
+            if isinstance(item, tuple):
+                repo_path, commit_hash = item
+            else:
+                # Forward raw git progress line (e.g. "Receiving objects: 42%")
+                yield {"type": "progress", "stage": "cloning", "message": item}
     except Exception as e:
         yield {"type": "error", "message": f"Clone failed: {e}"}
         return

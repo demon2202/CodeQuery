@@ -39,15 +39,21 @@ async function* readSSE(response) {
   }
 }
 
+const STALL_HINT_MS = 20000; // show a hint if no progress update for 20s
+
 export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
   const [stage, setStage] = useState('cloning');
   const [current, setCurrent] = useState(0);
   const [total, setTotal] = useState(0);
   const [message, setMessage] = useState('');
+  const [cloneDetail, setCloneDetail] = useState(''); // raw git progress line
   const [log, setLog] = useState([]);
   const [cancelling, setCancelling] = useState(false);
+  const [stalled, setStalled] = useState(false);
   const startedRef = useRef(false);
   const abortRef = useRef(null);
+  const lastEventRef = useRef(Date.now());
+  const terminalReceivedRef = useRef(false);
 
   useEffect(() => {
     if (startedRef.current) return;
@@ -55,6 +61,16 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
 
     const controller = new AbortController();
     abortRef.current = controller;
+
+    // Surface a "this is taking a while" hint if nothing's happened in a
+    // while — most commonly a Render free-tier cold start waking up, or a
+    // slow GitHub clone. Doesn't fail anything, just stops the spinner from
+    // looking broken with zero explanation.
+    const stallTimer = setInterval(() => {
+      if (Date.now() - lastEventRef.current > STALL_HINT_MS && !terminalReceivedRef.current) {
+        setStalled(true);
+      }
+    }, 2000);
 
     const startIndexing = async () => {
       let res;
@@ -67,6 +83,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
         });
       } catch (err) {
         if (err.name === 'AbortError') return; // user cancelled — handled by handleCancel
+        terminalReceivedRef.current = true;
         onProgress({
           type: 'error',
           message: 'Cannot reach the backend server. Is it running?\n\nStart it in another terminal:\n  cd backend\n  uvicorn app.main:app --port 8000',
@@ -88,6 +105,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
             }
           } catch {}
         }
+        terminalReceivedRef.current = true;
         onProgress({ type: 'error', message: detail });
         return;
       }
@@ -95,6 +113,11 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
       // Stream SSE events
       try {
         for await (const event of readSSE(res)) {
+          lastEventRef.current = Date.now();
+          setStalled(false);
+          if (event.type === 'complete' || event.type === 'error') {
+            terminalReceivedRef.current = true;
+          }
           onProgress(event);
           if (event.stage) {
             setStage(event.stage);
@@ -104,19 +127,40 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
             }
           }
           if (event.message) {
-            setMessage(event.message);
-            setLog(prev => [...prev.slice(-6), { stage: event.stage, msg: event.message }]);
+            // During cloning, git emits many raw progress lines ("Receiving objects: 42%").
+            // Show them as a sub-detail instead of the main message to avoid log spam.
+            if (event.stage === 'cloning' && event.message.match(/(Receiving|Resolving|Counting|Compressing|remote:|Cloning into|Updating files|Filtering)/i)) {
+              setCloneDetail(event.message);
+            } else {
+              setMessage(event.message);
+              setCloneDetail('');
+              setLog(prev => [...prev.slice(-6), { stage: event.stage, msg: event.message }]);
+            }
           }
+        }
+        // Stream ended (server closed the connection) without ever sending
+        // a 'complete' or 'error' event — this used to leave the UI frozen
+        // on whatever stage it last saw, forever, with no indication
+        // anything had gone wrong. Treat it as an explicit failure instead.
+        if (!terminalReceivedRef.current) {
+          onProgress({
+            type: 'error',
+            message: 'Connection to the server closed before indexing finished. This can happen on a slow network, a large repo, or if the server restarted mid-request (e.g. a free-tier host going to sleep). Try again — if it keeps happening, try a smaller repo.',
+          });
         }
       } catch (err) {
         if (err.name === 'AbortError') return; // user cancelled
+        terminalReceivedRef.current = true;
         onProgress({ type: 'error', message: `Stream error: ${err.message}` });
       }
     };
 
     startIndexing();
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      clearInterval(stallTimer);
+    };
   }, [repoUrl, onProgress]);
 
   const handleCancel = async () => {
@@ -166,6 +210,16 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
         )}
 
         <p className="index-msg">{message}</p>
+
+        {cloneDetail && (
+          <p className="index-clone-detail">{cloneDetail}</p>
+        )}
+
+        {stalled && (
+          <p className="index-stall-hint">
+            ⏳ This is taking a while — large repos or slow networks can take 60–120s to clone. Hang tight!
+          </p>
+        )}
 
         {log.length > 0 && (
           <div className="index-log">

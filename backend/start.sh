@@ -44,4 +44,4 @@ echo "Starting CodeQuery backend on http://localhost:8000"
 echo "API docs at http://localhost:8000/docs"
 echo ""
 
-uvicorn app.main:app --host "${CQ_HOST:-0.0.0.0}" --port "${CQ_PORT:-8000}" --reload
+uvicorn app.main:app --host "0.0.0.0" --port "${PORT:-${CQ_PORT:-8000}}" --workers 1

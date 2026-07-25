@@ -17,7 +17,7 @@ from ..models import ChunkSource
 from ..store.chroma_store import get_store
 from ..services.snapshot import get_file_lines
 from .cloner import get_repo_path
-from .embedder import encode_single, _get_provider
+from .embedder import encode_single
 
 logger = logging.getLogger(__name__)
 

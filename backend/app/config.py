@@ -37,15 +37,19 @@ OLLAMA_EMBED_MODEL = os.getenv("CQ_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 # Sentence-transformers model (used when EMBEDDING_PROVIDER=sentence-transformers,
 # i.e. whenever Ollama isn't reachable — this is the path used on Render/free hosts).
 #
-# jina-embeddings-v2-base-code is code-aware and meaningfully better at this task
-# than a general sentence model. IMPORTANT CAVEAT: it's a ~322M-param model
-# (~1.3GB in memory), much heavier than all-MiniLM-L6-v2 (~22M params). On a
-# memory-constrained free-tier host this may be slow to load or OOM. Test it on
-# your actual deployment before relying on it — if it fails, set
-# CQ_EMBEDDING_MODEL=all-MiniLM-L6-v2 to revert, or try a smaller general model
-# as a middle ground (e.g. BAAI/bge-small-en-v1.5, 33M params, not code-specific
-# but still better than nothing).
-EMBEDDING_MODEL = os.getenv("CQ_EMBEDDING_MODEL", "jina-embeddings-v2-base-code")
+# Defaults to all-MiniLM-L6-v2 (~22M params, ~90MB in memory) because it's safe
+# on memory-constrained free-tier hosts. It's a general sentence model, not
+# code-specific, so it produces weaker similarity scores for code Q&A
+# (~0.15-0.20 vs ~0.4+ for a code-aware model) — hybrid search (BM25 fusion)
+# compensates for a lot of this gap.
+#
+# jina-embeddings-v2-base-code is meaningfully better at code retrieval, but
+# it's a ~322M-param model (~1.3GB in memory) — CONFIRMED to cause an
+# out-of-memory kill (exit 137) on Render's free tier when set as default.
+# Only enable it if your host has real memory headroom (check your platform's
+# dashboard/metrics first), via:
+#   CQ_EMBEDDING_MODEL=jina-embeddings-v2-base-code
+EMBEDDING_MODEL = os.getenv("CQ_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
 # Smaller batches for the heavier jina model to reduce peak memory on CPU.
 _default_batch_size = "16" if "jina" in EMBEDDING_MODEL.lower() else "64"
@@ -68,9 +72,17 @@ RETRIEVAL_TOP_K = int(os.getenv("CQ_RETRIEVAL_TOP_K", "12"))
 # truth for your specific repos. If retrieval feels too strict/loose, hit
 # GET /api/chat/debug/search to see real similarity scores for your queries
 # and tune CQ_RETRIEVAL_MIN_SCORE from there.
+_provider_explicitly_set = os.getenv("CQ_EMBEDDING_PROVIDER") is not None
+
 if os.getenv("CQ_RETRIEVAL_MIN_SCORE") is not None:
     RETRIEVAL_MIN_SCORE = float(os.getenv("CQ_RETRIEVAL_MIN_SCORE"))
-elif EMBEDDING_PROVIDER == "ollama":
+elif _provider_explicitly_set and EMBEDDING_PROVIDER == "ollama" and "nomic" in OLLAMA_EMBED_MODEL.lower():
+    # Only trusted when CQ_EMBEDDING_PROVIDER was actually set by you — the
+    # unset default is "ollama" too, but embedder.py silently falls back to
+    # sentence-transformers at runtime if Ollama isn't reachable (true on
+    # hosts like Render that don't run Ollama), which would make this
+    # threshold wrong for what's actually running. Explicit opt-in avoids
+    # trusting a default that doesn't reflect reality on most free hosts.
     RETRIEVAL_MIN_SCORE = 0.25  # nomic-embed-text typically scores 0.40-0.70 on good matches
 elif "jina" in EMBEDDING_MODEL.lower():
     RETRIEVAL_MIN_SCORE = 0.30  # estimate — verify via /api/chat/debug/search

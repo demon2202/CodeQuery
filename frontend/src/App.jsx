@@ -197,8 +197,12 @@ export default function App() {
 
       {backendOk === false && (
         <div className="backend-banner">
-          <span>⚠ Backend not running.</span>
-          <code>uvicorn app.main:app --port 8000</code>
+          <span>⚠ Backend not reachable.</span>
+          {import.meta.env.VITE_API_BASE_URL ? (
+            <code>{import.meta.env.VITE_API_BASE_URL}</code>
+          ) : (
+            <code>uvicorn app.main:app --port 8000</code>
+          )}
           <span className="banner-hint">Retrying…</span>
         </div>
       )}

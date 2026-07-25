@@ -10,6 +10,7 @@ Sets up the FastAPI app with:
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -86,16 +87,22 @@ app = FastAPI(
 
 # ── Middleware ────────────────────────────────────────────────────────────────
 
-# CORS — allow the React frontend to call the API
+# CORS — allow the React frontend to call the API.
+# Set ALLOWED_ORIGINS in the environment as a comma-separated list of URLs.
+# Falls back to localhost dev origins so local development still works.
+_default_origins = (
+    "http://localhost:5173,"
+    "http://localhost:3000,"
+    "http://127.0.0.1:5173,"
+    "http://127.0.0.1:3000"
+)
+_raw_origins = os.getenv("ALLOWED_ORIGINS", _default_origins)
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # Vite dev server
-        "http://localhost:3000",  # Common React port
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
-        "https://codequery-eight.vercel.app"
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

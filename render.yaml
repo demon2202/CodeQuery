@@ -1,0 +1,34 @@
+# Usage:
+#   1. Push this file to your GitHub repo
+#   2. Go to render.com → New → Blueprint → connect your repo
+#   3. Set GROQ_API_KEY in the Render dashboard (Environment tab)
+#   4. Deploy
+
+services:
+  - type: web
+    name: codequery-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+
+    envVars:
+      # LLM provider — use Groq on Render (Ollama can't run here)
+      - key: CQ_LLM_PROVIDER
+        value: groq
+      - key: CQ_GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: GROQ_API_KEY
+        sync: false  # Set this manually in the Render dashboard — never commit API keys
+
+      # Embeddings — sentence-transformers, NOT Ollama (Ollama unavailable on Render)
+      - key: CQ_EMBEDDING_PROVIDER
+        value: sentence-transformers
+      - key: CQ_EMBEDDING_MODEL
+        value: all-MiniLM-L6-v2  # ~90MB RAM — safe on free tier. DO NOT use jina here (1.3GB -> OOM kill)
+
+      # Data directory — /tmp/data is writable on Render free tier.
+      # Data is lost on restart (ephemeral), but that's acceptable here.
+      - key: CQ_DATA_DIR
+        value: /tmp/data
+
