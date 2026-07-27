@@ -21,8 +21,6 @@ export default function App() {
   const [askAboutFile, setAskAboutFile] = useState(null);
   const cleanupRef = useRef(false);
 
-  // Refs so the pagehide handler always sees current values without
-  // re-attaching the listener on every state change.
   const repoUrlRef = useRef(repoUrl);
   const keepDataRef = useRef(keepData);
   const stateRef = useRef(state);
@@ -30,10 +28,6 @@ export default function App() {
   useEffect(() => { keepDataRef.current = keepData; }, [keepData]);
   useEffect(() => { stateRef.current = state; }, [state]);
 
-  // Auto-cleanup on tab close / navigation away — otherwise a repo you were
-  // just looking at (indexed or mid-index) sits in ChromaDB/snapshot storage
-  // forever unless you explicitly clicked "New repo". `keepalive: true` lets
-  // this fetch survive the page unload in modern browsers.
   useEffect(() => {
     const handlePageHide = () => {
       const url = repoUrlRef.current;
@@ -71,16 +65,13 @@ export default function App() {
       }
     };
     check();
-    // Only poll when backend is DOWN. Once it's up, stop hammering it.
     const interval = setInterval(() => {
       if (backendOk !== true) check();
     }, 5000);
     return () => { cancelled = true; clearInterval(interval); };
   }, [backendOk]);
 
-  // Cleanup old repo when starting a new one (if keepData is off)
   const handleIndexStart = useCallback(async (url) => {
-    // If there's an existing repo and keepData is off, clean it up
     if (repoUrl && !keepData && !cleanupRef.current) {
       cleanupRef.current = true;
       try {
@@ -90,7 +81,6 @@ export default function App() {
       } catch {}
       cleanupRef.current = false;
     }
-
     setRepoUrl(url);
     setError(null);
     setIndexedInfo(null);
@@ -107,8 +97,6 @@ export default function App() {
     }
   }, []);
 
-  // IndexingProgress already aborted the request and deleted any partially
-  // created data before calling this — just reset the view.
   const handleCancelIndexing = useCallback(() => {
     setState('idle');
     setRepoUrl('');
@@ -117,7 +105,6 @@ export default function App() {
   }, []);
 
   const handleReset = useCallback(async () => {
-    // If keepData is off, delete the repo's index + files
     if (repoUrl && !keepData) {
       try {
         await fetch(`${API_BASE}/api/repos/index?repo_url=${encodeURIComponent(repoUrl)}&delete_files=true`, {
@@ -125,7 +112,6 @@ export default function App() {
         });
       } catch {}
     }
-
     setState('idle');
     setRepoUrl('');
     setError(null);

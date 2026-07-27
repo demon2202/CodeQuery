@@ -1,20 +1,3 @@
-"""
-Embedding service for CodeQuery.
-
-Supports two providers:
-1. Ollama (RECOMMENDED for local use) — GPU-accelerated, code-aware models.
-2. fastembed (DEFAULT for Render/cloud) — ONNX-based, no torch, ~90MB RAM.
-   Uses onnxruntime which is already installed as a chromadb dependency.
-   Replaces sentence-transformers which requires torch (~250MB) and causes
-   OOM on Render free tier.
-
-Handles edge cases: empty strings, overly long texts, batch failures with
-automatic retry with smaller batches.
-
-Performance: content-hash embedding cache avoids re-embedding unchanged chunks
-during re-indexing. Cache is stored as a simple JSON file in the data directory.
-"""
-
 import hashlib
 import json
 import logging
@@ -26,18 +9,14 @@ from .. import config
 
 logger = logging.getLogger(__name__)
 
-# ── Embedding Cache ────────────────────────────────────────────────────
-# Content-hash → embedding vector cache. Stored as JSON in data directory.
-# Avoids re-embedding unchanged chunks on re-index. On a typical incremental
-# re-index where 90% of chunks are unchanged, this saves ~80% of embed time.
-
 _CACHE_PATH = config.DATA_DIR / "embed_cache.json"
-_cache: dict[str, list] = {}  # {content_hash: [float, ...]}
+_cache: dict[str, list] = {}
 _cache_dirty = False
+
+_MAX_EMBED_TEXT_LENGTH = 6000
 
 
 def _load_cache() -> None:
-    """Load embedding cache from disk."""
     global _cache, _cache_dirty
     if _cache:
         return
@@ -53,7 +32,6 @@ def _load_cache() -> None:
 
 
 def _save_cache() -> None:
-    """Save embedding cache to disk."""
     global _cache_dirty
     if not _cache_dirty:
         return
@@ -67,35 +45,19 @@ def _save_cache() -> None:
 
 
 def _content_hash(text: str) -> str:
-    """Hash text content for cache lookup."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-# nomic-embed-text has 8192 token context. Code averages ~3.5 chars/token
-# (much denser than prose). 8192 tokens * 3.5 = ~28k chars, BUT Ollama's
-# BPE tokenizer can be 2.5-3 chars/token for code with many symbols/idents.
-# At 2.5 chars/token, 8192 tokens = ~20k chars. We use 6000 chars to be
-# very safe — some chunks are ALL identifiers/symbols which tokenize poorly.
-_MAX_EMBED_TEXT_LENGTH = 6000
 
 
 def _sanitize_for_embed(text: str) -> str:
-    """Clean text for embedding: truncate, strip whitespace, handle empties.
-    
-    Important: we truncate at _MAX_EMBED_TEXT_LENGTH chars which is well
-    below the 8192-token limit even for dense code (lots of symbols/idents).
-    """
     if not text or not text.strip():
-        return " "  # Ollama rejects empty strings — send a space instead
+        return " "
     text = text.strip()
     if len(text) > _MAX_EMBED_TEXT_LENGTH:
         text = text[:_MAX_EMBED_TEXT_LENGTH]
     return text
 
 
-# ── Ollama Embedding ───────────────────────────────────────────────────
-
 def _ollama_embed_single(text: str) -> List[float]:
-    """Embed a single text using Ollama's /api/embed endpoint."""
     text = _sanitize_for_embed(text)
     resp = httpx.post(
         f"{config.OLLAMA_BASE_URL}/api/embed",
@@ -105,26 +67,13 @@ def _ollama_embed_single(text: str) -> List[float]:
     if resp.status_code != 200:
         detail = resp.text[:300] if resp.text else "no details"
         raise RuntimeError(f"Ollama embed error {resp.status_code}: {detail}")
-    data = resp.json()
-    return data["embeddings"][0]
+    return resp.json()["embeddings"][0]
 
 
 def _ollama_embed_batch(texts: List[str]) -> List[List[float]]:
-    """Embed a batch of texts using Ollama's /api/embed endpoint.
-
-    Handles failures by:
-    1. Checking embedding cache for already-seen content
-    2. Sanitizing texts (truncate, replace empty)
-    3. Starting with batch_size=64, retrying with smaller batches on failure
-    4. Falling back to single-item embedding if a batch keeps failing
-    5. Caching new embeddings for future reuse
-    """
     _load_cache()
 
-    # Sanitize all texts
     clean_texts = [_sanitize_for_embed(t) for t in texts]
-
-    # Check cache for each text
     all_embeddings = []
     uncached_indices = []
     uncached_texts = []
@@ -134,22 +83,19 @@ def _ollama_embed_batch(texts: List[str]) -> List[List[float]]:
         if h in _cache:
             all_embeddings.append(_cache[h])
         else:
-            all_embeddings.append(None)  # placeholder
+            all_embeddings.append(None)
             uncached_indices.append(i)
             uncached_texts.append(text)
 
-    # If everything is cached, we're done
     if not uncached_texts:
         return all_embeddings
 
-    # Embed uncached texts
     uncached_embeddings = []
     batch_size = 64
     batch_start = 0
 
     while batch_start < len(uncached_texts):
         batch = uncached_texts[batch_start:batch_start + batch_size]
-
         try:
             resp = httpx.post(
                 f"{config.OLLAMA_BASE_URL}/api/embed",
@@ -159,32 +105,24 @@ def _ollama_embed_batch(texts: List[str]) -> List[List[float]]:
             if resp.status_code != 200:
                 detail = resp.text[:300] if resp.text else "no details"
                 raise RuntimeError(f"Ollama embed error {resp.status_code}: {detail}")
-            data = resp.json()
-            uncached_embeddings.extend(data["embeddings"])
+            uncached_embeddings.extend(resp.json()["embeddings"])
             batch_start += batch_size
         except Exception as e:
             if batch_size <= 1:
-                # Even single items fail — log and use a zero vector
                 logger.error(f"Embedding failed for single item at index {batch_start}: {e}")
                 uncached_embeddings.append([0.0] * 768)
                 batch_start += 1
             else:
-                # Retry with smaller batch size
                 logger.warning(f"Batch embed failed (size {batch_size}), retrying with size {batch_size // 4}: {e}")
                 batch_size = max(1, batch_size // 4)
-                # Don't advance — retry this batch with smaller size
 
-    # Fill in uncached results and update cache
     global _cache_dirty
     for j, idx in enumerate(uncached_indices):
         emb = uncached_embeddings[j]
         all_embeddings[idx] = emb
-        # Cache it
-        h = _content_hash(uncached_texts[j])
-        _cache[h] = emb
+        _cache[_content_hash(uncached_texts[j])] = emb
         _cache_dirty = True
 
-    # Periodically save cache (every 100 new entries or so)
     if _cache_dirty and len(uncached_texts) >= 10:
         _save_cache()
 
@@ -192,7 +130,6 @@ def _ollama_embed_batch(texts: List[str]) -> List[List[float]]:
 
 
 def _check_ollama_embed_available() -> bool:
-    """Check if Ollama embedding model is available."""
     try:
         resp = httpx.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5.0)
         if resp.status_code != 200:
@@ -208,38 +145,25 @@ def _check_ollama_embed_available() -> bool:
         return False
 
 
-# ── FastEmbed (ONNX, no torch) ────────────────────────────────────────
-# Uses onnxruntime (already installed as a chromadb dependency).
-# This avoids importing torch (~250MB RAM) and sentence-transformers,
-# which caused OOM kills on Render free tier (512MB limit).
-
 _st_model = None
 
 
 def _get_st_model():
-    """Get or load the fastembed ONNX model (no torch required)."""
+    """Get or load the fastembed ONNX model."""
     global _st_model
     if _st_model is None:
         try:
             from fastembed import TextEmbedding
         except ImportError:
-            raise RuntimeError(
-                "fastembed is not installed. Run: pip install fastembed\n"
-                "(fastembed replaces sentence-transformers — no torch needed)"
-            )
+            raise RuntimeError("fastembed is not installed. Run: pip install fastembed")
         logger.info(f"Loading FastEmbed model: {config.EMBEDDING_MODEL}...")
-        # Use a stable cache dir so model persists between restarts when possible
         cache_dir = str(config.DATA_DIR / "fastembed_cache")
-        _st_model = TextEmbedding(
-            model_name=config.EMBEDDING_MODEL,
-            cache_dir=cache_dir,
-        )
+        _st_model = TextEmbedding(model_name=config.EMBEDDING_MODEL, cache_dir=cache_dir)
         logger.info("FastEmbed model loaded.")
     return _st_model
 
 
 def _st_encode_batch(texts: List[str]) -> List[List[float]]:
-    """Embed a batch using fastembed (ONNX, CPU-only, no torch)."""
     import numpy as np
     model = _get_st_model()
     clean = [_sanitize_for_embed(t) for t in texts]
@@ -248,7 +172,6 @@ def _st_encode_batch(texts: List[str]) -> List[List[float]]:
 
 
 def _st_encode_single(text: str) -> List[float]:
-    """Embed a single text using fastembed."""
     import numpy as np
     model = _get_st_model()
     text = _sanitize_for_embed(text)
@@ -257,12 +180,10 @@ def _st_encode_single(text: str) -> List[float]:
     return e.tolist() if isinstance(e, np.ndarray) else list(e)
 
 
-# ── Unified API ────────────────────────────────────────────────────────
-
 _provider = None
 
+
 def _get_provider() -> str:
-    """Determine the embedding provider. Auto-detects on first call."""
     global _provider
     if _provider is not None:
         return _provider
@@ -277,7 +198,7 @@ def _get_provider() -> str:
                 f"Ollama embedding model '{config.OLLAMA_EMBED_MODEL}' not found. "
                 f"Run: ollama pull {config.OLLAMA_EMBED_MODEL}"
             )
-            logger.warning("Falling back to sentence-transformers (poor code retrieval)")
+            logger.warning("Falling back to FastEmbed")
             _provider = "sentence-transformers"
     else:
         logger.info(f"Using FastEmbed (ONNX) embeddings with {config.EMBEDDING_MODEL}")
@@ -287,17 +208,15 @@ def _get_provider() -> str:
 
 
 def warm_up() -> None:
-    """Pre-load the embedding model and verify it works."""
-    _load_cache()  # Load cache on startup
+    _load_cache()
     provider = _get_provider()
     if provider == "ollama":
         try:
             result = _ollama_embed_single("warm up")
-            dim = len(result)
-            logger.info(f"Ollama embeddings ready ({dim}-dim)")
+            logger.info(f"Ollama embeddings ready ({len(result)}-dim)")
         except Exception as e:
             logger.error(f"Ollama embedding test failed: {e}")
-            logger.warning("Falling back to FastEmbed (ONNX, no torch)")
+            logger.warning("Falling back to FastEmbed")
             global _provider
             _provider = "sentence-transformers"
             _get_st_model()
@@ -310,7 +229,6 @@ def warm_up() -> None:
 
 
 def encode_batch(texts: List[str]) -> List[List[float]]:
-    """Embed a batch of texts. Returns list of embedding vectors."""
     if not texts:
         return []
     provider = _get_provider()
@@ -320,7 +238,6 @@ def encode_batch(texts: List[str]) -> List[List[float]]:
 
 
 def encode_single(text: str) -> List[float]:
-    """Embed a single text (typically a user's question)."""
     provider = _get_provider()
     if provider == "ollama":
         return _ollama_embed_single(text)
@@ -328,5 +245,4 @@ def encode_single(text: str) -> List[float]:
 
 
 def flush_cache() -> None:
-    """Force-save the embedding cache to disk. Call after indexing completes."""
     _save_cache()

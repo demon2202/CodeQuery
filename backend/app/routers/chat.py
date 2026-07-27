@@ -1,8 +1,3 @@
-"""
-Chat endpoint with dynamic starters and Mermaid diagram support.
-Uses snapshots for file-based starter generation (no filesystem needed).
-"""
-
 import json
 import logging
 import time
@@ -23,100 +18,43 @@ from ..store.chroma_store import get_store
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-# Cache health check results to avoid hammering Ollama on every poll.
 _health_cache = {"result": None, "timestamp": 0}
-_HEALTH_CACHE_TTL = 15.0  # seconds
-
-
-# ── File-pattern based starter questions ───────────────────────────────
+_HEALTH_CACHE_TTL = 15.0
 
 _PATTERNS = [
-    ("auth", [
-        "How does authentication work?",
-        "What auth middleware is used?",
-    ]),
-    ("route", [
-        "How are routes defined?",
-        "What does the routing structure look like?",
-    ]),
-    ("model", [
-        "What are the main data models?",
-        "How is the database schema structured?",
-    ]),
-    ("config", [
-        "What configuration options are available?",
-        "How is the app configured?",
-    ]),
-    ("test", [
-        "How is testing set up?",
-        "What testing framework is used?",
-    ]),
-    ("middleware", [
-        "What middleware is applied?",
-        "How does the request pipeline work?",
-    ]),
-    ("api", [
-        "What API endpoints are available?",
-        "How is the API structured?",
-    ]),
-    ("util", [
-        "What utility functions exist?",
-        "What helper modules are available?",
-    ]),
-    ("component", [
-        "What are the main UI components?",
-        "How is the component hierarchy organized?",
-    ]),
-    ("service", [
-        "What services does the app use?",
-        "How are services structured?",
-    ]),
-    ("db", [
-        "How is the database connected?",
-        "What ORM or query layer is used?",
-    ]),
-    ("handler", [
-        "How are requests handled?",
-        "What are the main handler functions?",
-    ]),
-    ("app.", [
-        "What does the main entry point do?",
-        "How is the application initialized?",
-    ]),
-    ("main.", [
-        "What does the main entry point do?",
-        "How is the application bootstrapped?",
-    ]),
-    ("index.", [
-        "What does the main entry point do?",
-        "How is the app started?",
-    ]),
+    ("auth", ["How does authentication work?", "What auth middleware is used?"]),
+    ("route", ["How are routes defined?", "What does the routing structure look like?"]),
+    ("model", ["What are the main data models?", "How is the database schema structured?"]),
+    ("config", ["What configuration options are available?", "How is the app configured?"]),
+    ("test", ["How is testing set up?", "What testing framework is used?"]),
+    ("middleware", ["What middleware is applied?", "How does the request pipeline work?"]),
+    ("api", ["What API endpoints are available?", "How is the API structured?"]),
+    ("util", ["What utility functions exist?", "What helper modules are available?"]),
+    ("component", ["What are the main UI components?", "How is the component hierarchy organized?"]),
+    ("service", ["What services does the app use?", "How are services structured?"]),
+    ("db", ["How is the database connected?", "What ORM or query layer is used?"]),
+    ("handler", ["How are requests handled?", "What are the main handler functions?"]),
+    ("app.", ["What does the main entry point do?", "How is the application initialized?"]),
+    ("main.", ["What does the main entry point do?", "How is the application bootstrapped?"]),
+    ("index.", ["What does the main entry point do?", "How is the app started?"]),
 ]
 
 
 def _generate_file_based_starters(repo_url: str) -> list[str]:
-    """Generate starter questions based on the repo's file structure.
-
-    Uses snapshot first, falls back to filesystem.
-    """
     try:
-        # Try snapshot first
         dir_names = get_dir_names(repo_url)
         file_paths = get_all_file_paths(repo_url)
 
         if not dir_names and not file_paths:
-            # Fallback: try filesystem (backward compatibility)
             repo_path = get_repo_path(repo_url)
             if not repo_path.exists():
                 return _default_starters()
-
             for item in repo_path.rglob("*"):
                 if item.is_dir():
                     dir_names.add(item.name.lower())
                 elif item.is_file():
                     file_paths.append(str(item.name).lower())
 
-        # Build a set of all names for pattern matching
         all_names = dir_names | {fp.split("/")[-1].split(".")[0].lower() for fp in file_paths}
 
         questions = []
@@ -153,13 +91,8 @@ def _default_starters() -> list[str]:
 async def get_starters(repo_url: str = Query(..., description="Repository URL")):
     """Get dynamic starter questions for a repo."""
     file_starters = _generate_file_based_starters(repo_url)
+    result = {"starters": file_starters, "llm_starters": None}
 
-    result = {
-        "starters": file_starters,
-        "llm_starters": None,
-    }
-
-    # Try to get LLM-generated starters (fast — just one call)
     try:
         store = get_store()
         stats = store.get_collection_stats(repo_url)
@@ -205,8 +138,7 @@ Questions:"""
                     },
                 )
                 if resp.status_code == 200:
-                    data = resp.json()
-                    text = data.get("response", "").strip()
+                    text = resp.json().get("response", "").strip()
                     llm_qs = [q.strip().lstrip("0123456789.-) ") for q in text.split("\n") if q.strip()]
                     llm_qs = [q for q in llm_qs if len(q) > 5 and len(q) < 150][:4]
                     if llm_qs:
@@ -230,9 +162,6 @@ async def chat(request: ChatRequest):
 
     async def event_stream():
         try:
-            # Retrieval uses a context-aware query (folds in the previous turn
-            # so follow-ups like "where's the token refreshed" retrieve
-            # correctly). The LLM still gets the original, unmodified question.
             if config.QUERY_REWRITE_LLM_ENABLED:
                 search_query = await query_rewrite.llm_rewrite_query(request.question, request.history)
             else:
@@ -289,6 +218,7 @@ async def health_check():
         await check_git_available()
     except RuntimeError:
         git_ok = False
+
     result = HealthResponse(
         status="healthy" if ollama_status.get("running") and git_ok else "degraded",
         ollama_running=ollama_status.get("running", False),

@@ -1,14 +1,5 @@
 """
-Indexing orchestrator. Clone → walk → chunk → embed → store → snapshot → cleanup.
-
-After indexing, the full git clone is replaced with a lightweight SQLite snapshot.
-This saves 80-95% disk space while keeping all features working.
-
-Performance optimizations:
-- Embed batch size increased from 16 to 64 (fewer HTTP round trips to Ollama)
-- File tree and stats pre-computed during indexing (no on-demand recomputation)
-- Snapshot creation is fast (<1s for most repos — just reads + SQLite inserts)
-- Repo directory deleted after snapshot (saves disk, no .git folder needed)
+Indexing orchestrator: clone → walk → chunk → embed → store → snapshot → cleanup.
 """
 
 import asyncio
@@ -24,7 +15,6 @@ from .walker import walk_source_files
 from .chunker import chunk_file, CodeChunk
 from .embedder import encode_batch
 
-# flush_cache may not exist in older embedder versions — handle gracefully
 try:
     from .embedder import flush_cache as _flush_embed_cache
 except ImportError:
@@ -33,14 +23,10 @@ from .snapshot import create_snapshot
 
 logger = logging.getLogger(__name__)
 
-# Embed batch size — larger = fewer HTTP round trips to Ollama.
-# nomic-embed-text handles 64 texts per request efficiently on GPU.
-# Old value was 16, which meant 4x more HTTP requests for the same work.
 EMBED_BATCH_SIZE = 64
 
 
 def _build_file_tree(repo_path: Path) -> dict:
-    """Build a nested file tree structure from the repo on disk."""
     skip_dirs = config.SKIP_DIRS
     skip_exts = config.SKIP_EXTENSIONS
     all_exts = config.ALL_SOURCE_EXTENSIONS
@@ -48,9 +34,7 @@ def _build_file_tree(repo_path: Path) -> dict:
     def build_tree(path: Path, rel: str = "") -> dict:
         result = {"name": path.name, "type": "dir", "path": rel, "children": []}
         try:
-            entries = sorted(
-                path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
-            )
+            entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
         except PermissionError:
             return result
 
@@ -91,7 +75,6 @@ def _build_repo_stats(
     chunks: list[CodeChunk],
     chunk_count: int,
 ) -> dict:
-    """Pre-compute repo stats during indexing."""
     lang_counts: dict[str, int] = {}
     file_count = 0
     func_count = 0
@@ -105,13 +88,10 @@ def _build_repo_stats(
             func_count += 1
 
     total_files = max(file_count, 1)
-    languages = []
-    for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1]):
-        languages.append({
-            "name": lang,
-            "files": count,
-            "pct": round(count / total_files * 100),
-        })
+    languages = [
+        {"name": lang, "files": count, "pct": round(count / total_files * 100)}
+        for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])
+    ]
 
     return {
         "files": file_count,
@@ -127,7 +107,7 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
     store = get_store()
     loop = asyncio.get_event_loop()
 
-    # 1. Clone — stream real-time progress lines from git to the frontend
+    # 1. Clone
     yield {"type": "progress", "stage": "cloning", "message": f"Cloning {repo_url}..."}
     repo_path = None
     commit_hash = None
@@ -136,7 +116,6 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
             if isinstance(item, tuple):
                 repo_path, commit_hash = item
             else:
-                # Forward raw git progress line (e.g. "Receiving objects: 42%")
                 yield {"type": "progress", "stage": "cloning", "message": item}
     except Exception as e:
         yield {"type": "error", "message": f"Clone failed: {e}"}
@@ -147,8 +126,6 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
     old_hash = store.get_commit_hash(repo_url)
     changed_files = None
 
-    # If the repo was previously snapshotted+deleted, old_hash still exists
-    # but the old commit won't be in the new shallow clone. Force full re-index.
     if old_hash and old_hash != commit_hash:
         changed_files = await get_changed_files(repo_path, old_hash, commit_hash)
         if changed_files:
@@ -163,48 +140,41 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
                 except Exception:
                     pass
         else:
-            # git diff failed (old commit not in shallow clone) — full re-index
             logger.info("Incremental diff failed — doing full re-index")
             changed_files = None
     elif old_hash == commit_hash:
-        # Same commit — but if repo was deleted by snapshot, we need to re-walk
-        # since ChromaDB data may still be there from the previous index
-        yield {
-            "type": "progress",
-            "stage": "incremental",
-            "message": "Already up to date (same commit)",
-        }
+        yield {"type": "progress", "stage": "incremental", "message": "Already up to date (same commit)"}
 
     # 3. Walk files
     yield {"type": "progress", "stage": "walking", "message": "Scanning files..."}
 
-    # Verify repo directory exists and has content
     if not repo_path.exists():
-        yield {"type": "error", "message": f"Repo directory not found: {repo_path}. The clone may have failed silently."}
+        yield {"type": "error", "message": f"Repo directory not found: {repo_path}"}
         return
 
-    # Quick sanity check — count total files in the repo (including non-source)
     total_all_files = sum(1 for _ in repo_path.rglob("*") if _.is_file())
     if total_all_files == 0:
-        yield {"type": "error", "message": f"Repo directory is empty: {repo_path}. Git clone may have failed — try deleting the repo data and re-indexing."}
+        yield {"type": "error", "message": f"Repo directory is empty: {repo_path}"}
         return
 
     file_lang_pairs = walk_source_files(repo_path, changed_files)
     total_files = len(file_lang_pairs)
     if total_files == 0:
-        yield {"type": "error", "message": f"No source files found. Repo has {total_all_files} files but none match supported extensions (.py, .js, .ts, .jsx, .tsx, .c, .h, .java, .go, .rs, .rb, .php, .html, .css, .md, etc.). Check the repo is a code repository."}
+        yield {
+            "type": "error",
+            "message": (
+                f"No source files found. Repo has {total_all_files} files but none match "
+                "supported extensions (.py, .js, .ts, .jsx, .tsx, .c, .h, .java, .go, .rs, "
+                ".rb, .php, .html, .css, .md, etc.)."
+            ),
+        }
         return
-    yield {
-        "type": "progress",
-        "stage": "walking",
-        "message": f"Found {total_files} source files",
-        "total": total_files,
-    }
+    yield {"type": "progress", "stage": "walking", "message": f"Found {total_files} source files", "total": total_files}
 
-    # 4. Build file tree (while repo is still on disk)
+    # 4. Build file tree (while repo is on disk)
     tree = _build_file_tree(repo_path)
 
-    # 5. Parse files into chunks
+    # 5. Parse into chunks
     yield {"type": "progress", "stage": "parsing", "current": 0, "total": total_files}
     all_chunks: list[CodeChunk] = []
     for i, (fp, lang) in enumerate(file_lang_pairs):
@@ -212,46 +182,23 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
             all_chunks.extend(chunk_file(fp, repo_path, lang))
         except Exception as e:
             logger.warning(f"Parse error {fp}: {e}")
-        yield {
-            "type": "progress",
-            "stage": "parsing",
-            "current": i + 1,
-            "total": total_files,
-        }
+        yield {"type": "progress", "stage": "parsing", "current": i + 1, "total": total_files}
 
     if not all_chunks:
         yield {"type": "error", "message": "No chunks extracted from repo"}
         return
-    yield {
-        "type": "progress",
-        "stage": "parsing",
-        "message": f"{total_files} files → {len(all_chunks)} chunks",
-    }
+    yield {"type": "progress", "stage": "parsing", "message": f"{total_files} files → {len(all_chunks)} chunks"}
 
-    # 6. Build stats from chunks (pre-compute for later /summary endpoint)
-    # Note: chunk_count is len(all_chunks) now; actual stored count may differ
-    # if upsert updates existing chunks. For stats display, all_chunks is fine.
+    # 6. Pre-compute stats
     stats = _build_repo_stats(file_lang_pairs, all_chunks, len(all_chunks))
 
-    # 7. Embed in batches — larger batch size for fewer HTTP round trips
+    # 7. Embed
     total_chunks = len(all_chunks)
-    yield {
-        "type": "progress",
-        "stage": "embedding",
-        "current": 0,
-        "total": total_chunks,
-    }
+    yield {"type": "progress", "stage": "embedding", "current": 0, "total": total_chunks}
     all_embeddings: list[list[float]] = []
 
     for i in range(0, total_chunks, EMBED_BATCH_SIZE):
-        chunk_batch = all_chunks[i : i + EMBED_BATCH_SIZE]
-        # Embed filename + content together, not content alone. Filenames are
-        # never otherwise part of the searchable text, so a question like
-        # "how does package.json manage dependencies" has zero lexical/semantic
-        # anchor to the actual package.json chunk — only to whichever chunk
-        # happens to share generic words like "dependencies". The file_path
-        # prefix here is embedding-only; the stored/displayed document text
-        # (below, at storage time) stays as pure chunk.content.
+        chunk_batch = all_chunks[i: i + EMBED_BATCH_SIZE]
         batch = [f"{c.file_path}\n{c.content}" for c in chunk_batch]
         try:
             embeddings = await loop.run_in_executor(None, encode_batch, batch)
@@ -259,25 +206,14 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         except Exception as e:
             yield {"type": "error", "message": f"Embedding failed: {e}"}
             return
-        done = min(i + EMBED_BATCH_SIZE, total_chunks)
-        yield {
-            "type": "progress",
-            "stage": "embedding",
-            "current": done,
-            "total": total_chunks,
-        }
+        yield {"type": "progress", "stage": "embedding", "current": min(i + EMBED_BATCH_SIZE, total_chunks), "total": total_chunks}
 
     # 8. Store in ChromaDB
-    yield {
-        "type": "progress",
-        "stage": "storing",
-        "current": 0,
-        "total": total_chunks,
-    }
+    yield {"type": "progress", "stage": "storing", "current": 0, "total": total_chunks}
     store_batch = 500
     for i in range(0, total_chunks, store_batch):
-        batch_c = all_chunks[i : i + store_batch]
-        batch_e = all_embeddings[i : i + store_batch]
+        batch_c = all_chunks[i: i + store_batch]
+        batch_e = all_embeddings[i: i + store_batch]
         try:
             await loop.run_in_executor(
                 None,
@@ -291,44 +227,30 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         except Exception as e:
             yield {"type": "error", "message": f"Storage failed: {e}"}
             return
-        yield {
-            "type": "progress",
-            "stage": "storing",
-            "current": min(i + store_batch, total_chunks),
-            "total": total_chunks,
-        }
+        yield {"type": "progress", "stage": "storing", "current": min(i + store_batch, total_chunks), "total": total_chunks}
 
-    # Save commit hash for incremental re-indexing
     try:
         store.set_commit_hash(repo_url, commit_hash)
     except Exception as e:
         logger.warning(f"Commit hash save failed: {e}")
 
-    # Flush embedding cache to disk
     if _flush_embed_cache:
         try:
             _flush_embed_cache()
         except Exception as e:
             logger.warning(f"Embed cache flush failed: {e}")
 
-    # 9. Create snapshot and delete repo (saves 80-95% disk space)
-    yield {
-        "type": "progress",
-        "stage": "storing",
-        "message": "Saving snapshot & cleaning up...",
-    }
+    # 9. Snapshot + cleanup
+    yield {"type": "progress", "stage": "storing", "message": "Saving snapshot & cleaning up..."}
     try:
-        # Update stats with actual chunk count from ChromaDB
         try:
             db_stats = store.get_collection_stats(repo_url)
             stats["chunks"] = db_stats["chunk_count"]
         except Exception:
             pass
-
         create_snapshot(repo_url, repo_path, tree, stats)
     except Exception as e:
         logger.warning(f"Snapshot creation failed (non-critical): {e}")
-        # Don't fail the whole indexing if snapshot fails — repo is still on disk
 
     yield {
         "type": "complete",

@@ -1,15 +1,8 @@
 """
 AST-aware code chunker.
-
-Key design decisions:
-- Each function/class = one chunk. Independently retrievable.
-- Methods inside classes: separate chunks with parent=ClassName.
-- NO "preamble" or "epilogue" chunks — these are usually just comments,
-  imports, or whitespace between functions. They pollute search results.
-  Instead, imports and module-level code get a single "module" chunk
-  at the top of the file IF it has meaningful content (not just comments).
-- Skip chunks that are only comments/whitespace — these are noise for retrieval.
-- Fallback: sliding-window for unsupported languages.
+Each function/class = one chunk. Methods inside classes get separate chunks with parent=ClassName.
+Imports and module-level code get a single "module" chunk if they have meaningful content.
+Falls back to sliding-window for unsupported languages.
 """
 
 import os
@@ -55,7 +48,6 @@ class CodeChunk:
         }
 
 
-# Language configs
 _LANG_CONFIGS = {
     "python": {
         "lang": lambda: Language(tspython.language()),
@@ -86,29 +78,21 @@ _LANG_CONFIGS = {
 
 
 def _is_only_comments(text: str) -> bool:
-    """Check if text is only comments, whitespace, and separator lines."""
-    # Strip common patterns: # ===, # ---, blank lines, single-line comments
     lines = text.strip().split("\n")
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-        # Python/JS/TS comment lines
         if stripped.startswith("#") or stripped.startswith("//"):
-            # Skip separator lines like # ==== or # ----
             content = stripped.lstrip("#/").strip()
             if re.match(r'^[=\-_*~]+$', content):
                 continue
-            # It's a real comment with actual text — that's OK, keep it
-            # But if the ENTIRE chunk is just one-liner comments, still skip
             continue
-        # If we reach here, there's actual code — don't skip
         return False
-    return True  # All lines are comments/whitespace/separators
+    return True
 
 
 def _has_real_code(text: str) -> bool:
-    """Check if text has actual code, not just comments/whitespace."""
     lines = text.strip().split("\n")
     real_lines = 0
     for line in lines:
@@ -118,10 +102,10 @@ def _has_real_code(text: str) -> bool:
         if stripped.startswith("#") or stripped.startswith("//"):
             content = stripped.lstrip("#/").strip()
             if re.match(r'^[=\-_*~]+$', content):
-                continue  # separator line
-            continue  # comment line
+                continue
+            continue
         real_lines += 1
-    return real_lines >= 2  # At least 2 lines of actual code
+    return real_lines >= 2
 
 
 def chunk_file(file_path: Path, repo_root: Path, language: str) -> List[CodeChunk]:
@@ -146,25 +130,20 @@ def chunk_file(file_path: Path, repo_root: Path, language: str) -> List[CodeChun
 
 
 def _split_long_chunk(chunk: CodeChunk, max_chars: int = 2000) -> List[CodeChunk]:
-    """Split a chunk that exceeds max_chars into smaller pieces.
-    
-    Tries to split at line boundaries for cleaner chunks.
-    """
+    """Split a chunk that exceeds max_chars into smaller pieces at line boundaries."""
     if len(chunk.content) <= max_chars:
         return [chunk]
-    
+
     lines = chunk.content.split("\n")
     pieces = []
     current_lines = []
     current_start = chunk.start_line
-    
-    for i, line in enumerate(lines):
+
+    for line in lines:
         current_lines.append(line)
         current_text = "\n".join(current_lines)
-        
-        # If adding this line pushes us over the limit, flush
+
         if len(current_text) > max_chars and len(current_lines) > 1:
-            # Remove the last line, flush the rest
             current_lines.pop()
             pieces.append(CodeChunk(
                 content="\n".join(current_lines),
@@ -178,8 +157,7 @@ def _split_long_chunk(chunk: CodeChunk, max_chars: int = 2000) -> List[CodeChunk
             ))
             current_start = current_start + len(current_lines)
             current_lines = [line]
-    
-    # Flush remaining
+
     if current_lines:
         remaining_text = "\n".join(current_lines)
         if remaining_text.strip() and not _is_only_comments(remaining_text):
@@ -193,7 +171,7 @@ def _split_long_chunk(chunk: CodeChunk, max_chars: int = 2000) -> List[CodeChunk
                 language=chunk.language,
                 parent=chunk.parent,
             ))
-    
+
     return pieces if pieces else [chunk]
 
 
@@ -216,12 +194,10 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
     chunk_types = cfg["chunk_types"]
     deco_wrapper = cfg.get("decorator_wrapper")
 
-    # Track where the last structural node ended
     last_end = 0
     first_structural_found = False
 
     for child in tree.root_node.children:
-        # Unwrap decorator wrapper if present
         actual = child
         if deco_wrapper and child.type == deco_wrapper:
             for sub in child.children:
@@ -232,11 +208,9 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
         if actual.type not in chunk_types:
             continue
 
-        # Code before this node (module-level: imports, constants, etc.)
         node_start = child.start_point[0]
         if not first_structural_found and node_start > 0:
             preamble = "\n".join(lines[0:node_start])
-            # Only add module chunk if it has real code (not just comments)
             if _has_real_code(preamble):
                 chunks.append(CodeChunk(
                     content=preamble, file_path=rel_path,
@@ -246,7 +220,6 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
                 ))
             first_structural_found = True
         elif first_structural_found and node_start > last_end:
-            # Code between two structural nodes — skip if just comments
             gap = "\n".join(lines[last_end:node_start])
             if _has_real_code(gap):
                 chunks.append(CodeChunk(
@@ -261,14 +234,11 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
         end = child.end_point[0] + 1
         text = "\n".join(lines[child.start_point[0]:child.end_point[0] + 1])
 
-        # Skip chunks that are only comments/whitespace
         if _is_only_comments(text):
             last_end = child.end_point[0] + 1
             continue
 
-        # If it's a class, also extract methods as separate chunks
         if actual.type in ("class_definition", "class_declaration"):
-            # First: add class header (declaration + docstring, before first method)
             header_end = _class_header_end(actual)
             if header_end > actual.start_point[0]:
                 header_text = "\n".join(lines[actual.start_point[0]:header_end])
@@ -278,7 +248,6 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
                         start_line=actual.start_point[0] + 1, end_line=header_end,
                         name=name, chunk_type="class", language=language,
                     ))
-            # Then: extract each method
             for body in actual.children:
                 if body.type in cfg["body_types"]:
                     for member in body.children:
@@ -301,7 +270,6 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
                                     language=language, parent=name,
                                 ))
         else:
-            # Function — one chunk
             chunks.append(CodeChunk(
                 content=text, file_path=rel_path,
                 start_line=start, end_line=end,
@@ -310,7 +278,6 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
 
         last_end = child.end_point[0] + 1
 
-    # Trailing code after last structural node — only if it has real code
     if last_end < len(lines):
         trailing = "\n".join(lines[last_end:])
         if _has_real_code(trailing):
@@ -321,11 +288,9 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
                 chunk_type="module", language=language,
             ))
 
-    # If tree-sitter parsed but found nothing structural, fall back
     if not chunks and source.strip():
         return _chunk_sliding_window(source, rel_path, language)
 
-    # Enforce max chunk size — split oversized chunks at line boundaries
     max_chars = config.MAX_CHUNK_CHARS
     final_chunks = []
     for c in chunks:
@@ -338,7 +303,6 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
 
 
 def _class_header_end(node: Node) -> int:
-    """Find end line of class declaration + docstring (before first method)."""
     for body in node.children:
         if body.type in ("block", "class_body", "declaration_list"):
             for child in body.children:
@@ -350,7 +314,6 @@ def _class_header_end(node: Node) -> int:
 
 
 def _node_name(node: Node) -> str | None:
-    """Extract name from a function/class node."""
     name_node = node.child_by_field_name("name")
     return name_node.text.decode("utf8") if name_node else None
 
@@ -361,7 +324,7 @@ def _derive_name(rel_path: str, node_type: str) -> str:
 
 
 def _chunk_sliding_window(source: str, rel_path: str, language: str) -> List[CodeChunk]:
-    """Fallback for unsupported languages."""
+    """Fallback chunker for unsupported languages."""
     lines = source.split("\n")
     size = config.SLIDING_WINDOW_LINES
     overlap = config.SLIDING_WINDOW_OVERLAP

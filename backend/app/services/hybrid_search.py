@@ -1,17 +1,6 @@
 """
-Hybrid retrieval — combines BM25 keyword search with vector similarity search.
-
-Why hybrid: pure vector search is weak at exact identifier matching. If someone
-asks "what does handleSubmit do", cosine similarity on a general embedding model
-may not rank the handleSubmit chunk first — but a keyword index will, instantly.
-BM25 catches exact names/strings; vectors catch semantic/conceptual matches.
-The two are fused with Reciprocal Rank Fusion (RRF), which needs no score
-normalization and is robust even when the two rankers disagree completely.
-
-An optional cross-encoder reranking pass can run on the fused candidates for
-extra precision. It's off by default (CQ_RERANK_ENABLED=false) because it loads
-a second small transformer model into memory — fine on most machines, but worth
-being deliberate about on a memory-constrained free-tier host.
+Hybrid retrieval — BM25 keyword search fused with vector similarity via RRF.
+Optional cross-encoder reranking pass on the fused candidates.
 """
 
 import logging
@@ -23,11 +12,6 @@ from .. import config
 
 logger = logging.getLogger(__name__)
 
-# ── BM25 keyword index, cached per repo ─────────────────────────────────────
-# Rebuilt lazily whenever the underlying collection's chunk count changes
-# (i.e. after indexing/re-indexing/deleting a repo). Avoids rebuilding on
-# every single question.
-
 _bm25_cache: dict[str, dict] = {}
 _bm25_lock = threading.Lock()
 
@@ -36,10 +20,7 @@ _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def _tokenize(text: str) -> list[str]:
-    """Split code text into lowercase tokens, breaking up camelCase/snake_case
-    identifiers so 'handleSubmit' and 'handle_submit' both index as
-    ['handle', 'submit'] alongside the original whole token.
-    """
+    """Split code text into lowercase tokens, breaking camelCase and snake_case."""
     tokens: list[str] = []
     for raw in _TOKEN_RE.findall(text):
         tokens.append(raw.lower())
@@ -52,8 +33,7 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _get_bm25_index(repo_url: str):
-    """Get (or rebuild) the BM25 index for a repo. Returns None if the repo
-    has no chunks yet or BM25 dependency isn't installed."""
+    """Get (or rebuild) the BM25 index for a repo. Returns None if unavailable."""
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
@@ -80,10 +60,7 @@ def _get_bm25_index(repo_url: str):
         if not ids:
             return None
 
-        # Tokenize file_path + name alongside content. Filenames otherwise
-        # never appear in the searchable text (documents are pure code
-        # content), so a question mentioning "package.json" or "mapStore.ts"
-        # by name would have no lexical anchor to its own file without this.
+        # Tokenize file_path + name + content so filename queries have a lexical anchor
         tokenized = [
             _tokenize(f"{meta.get('file_path', '')} {meta.get('name', '')} {doc}")
             for doc, meta in zip(documents, metadatas)
@@ -106,18 +83,9 @@ _FILENAME_TOKEN_RE = re.compile(r"[\w\-]+\.[A-Za-z0-9]{1,8}")
 
 
 def find_filename_matches(repo_url: str, question: str) -> tuple[list[str], list[str]]:
-    """Detect filename-like mentions in the question (e.g. "package.json",
-    "mapStore.ts") and check them against the indexed corpus.
+    """Detect filename mentions in the question and match them against indexed chunks.
 
-    This exists because embeddings/BM25 match on file *content*, not file
-    *names* — asking specifically about a file by name has no guaranteed
-    lexical anchor to that exact file otherwise, especially for config/manifest
-    files whose content shares generic vocabulary with other files.
-
-    Returns (matched_chunk_ids, unmatched_filenames). unmatched_filenames are
-    filenames the question named that don't exist anywhere in the indexed
-    repo — used downstream to stop the LLM from describing a file it never
-    actually saw.
+    Returns (matched_chunk_ids, unmatched_filenames).
     """
     entry = _get_bm25_index(repo_url)
     if entry is None:
@@ -164,30 +132,18 @@ def bm25_search(repo_url: str, question: str, n_results: int) -> list[tuple[str,
         return []
 
     scores = entry["bm25"].get_scores(query_tokens)
-    ranked = sorted(
-        range(len(scores)), key=lambda i: scores[i], reverse=True
-    )[:n_results]
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_results]
     return [(entry["ids"][i], float(scores[i])) for i in ranked if scores[i] > 0]
 
 
-def reciprocal_rank_fusion(
-    ranked_lists: list[list[str]], k: int = 60
-) -> dict[str, float]:
-    """Combine multiple ranked ID lists into one fused score per ID.
-
-    RRF score for an item = sum over lists of 1 / (k + rank_in_that_list).
-    Items missing from a list simply don't contribute from it. This needs no
-    score normalization between BM25 (unbounded) and cosine similarity
-    ([0,1]), which is why it's the standard choice for hybrid search fusion.
-    """
+def reciprocal_rank_fusion(ranked_lists: list[list[str]], k: int = 60) -> dict[str, float]:
+    """Combine multiple ranked ID lists into fused scores via RRF."""
     fused: dict[str, float] = {}
     for ranked_ids in ranked_lists:
         for rank, chunk_id in enumerate(ranked_ids):
             fused[chunk_id] = fused.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
     return fused
 
-
-# ── Optional cross-encoder reranker ─────────────────────────────────────────
 
 _reranker = None
 _reranker_lock = threading.Lock()
@@ -211,12 +167,7 @@ def _get_reranker():
 
 
 def rerank(question: str, candidates: list[tuple[str, str]]) -> list[tuple[str, float]]:
-    """Rerank (chunk_id, document_text) pairs against the question.
-
-    Returns [(chunk_id, rerank_score), ...] sorted best-first. Falls back to
-    returning candidates unscored (score=0.0, original order) if the reranker
-    can't load — callers should treat that as "no reranking happened".
-    """
+    """Rerank (chunk_id, document_text) pairs against the question. Returns sorted best-first."""
     if not candidates:
         return []
     model = _get_reranker()

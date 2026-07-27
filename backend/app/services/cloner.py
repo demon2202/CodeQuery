@@ -1,14 +1,3 @@
-"""
-Git clone service — fixed command injection + better Windows error handling.
-
-SECURITY: Validate the URL strictly before passing to git. Only allow
-https://github.com/owner/repo format. No shell metacharacters.
-
-WINDOWS FIX: Check if git is available before trying to clone.
-Give clear error messages when git is missing or clone fails.
-Also capture stdout alongside stderr for better diagnostics.
-"""
-
 import asyncio
 import hashlib
 import logging
@@ -22,13 +11,12 @@ from .. import config
 
 logger = logging.getLogger(__name__)
 
-_GIT_EXE: str = "git"  # default — overridden below if we can find it
+_GIT_EXE: str = "git"
 
 _git_candidate = shutil.which("git")
 if _git_candidate:
     _GIT_EXE = _git_candidate
 else:
-    # Common Windows installation paths
     _windows_fallbacks = [
         r"C:\Program Files\Git\cmd\git.exe",
         r"C:\Program Files (x86)\Git\cmd\git.exe",
@@ -41,8 +29,6 @@ else:
 
 logger.info(f"Git executable resolved to: {_GIT_EXE}")
 
-# Strict URL validation — only allow safe GitHub URLs
-# Prevents command injection via shell metacharacters in repo_url
 _SAFE_URL_RE = re.compile(
     r"^https?://(www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$"
 )
@@ -60,20 +46,16 @@ def validate_repo_url(url: str) -> str:
 
 
 def get_repo_path(repo_url: str) -> Path:
-    """Get the local directory path for a repo URL."""
     url = repo_url.rstrip("/")
     if url.endswith(".git"):
         url = url[:-4]
     parts = url.split("/")
-    # Use hash for uniqueness, keep readable prefix
     safe_name = f"{parts[-2]}_{parts[-1]}" if len(parts) >= 2 else hashlib.sha256(url.encode()).hexdigest()[:16]
     return config.REPOS_DIR / safe_name
 
 
 async def _run_git(*args: str, cwd: str | None = None) -> Tuple[str, str, int]:
     """Run a git command. Returns (stdout, stderr, returncode)."""
-    # Replace the first token ("git") with the resolved absolute path so the
-    # subprocess finds git even when PATH is incomplete (common on Windows).
     resolved_args = (_GIT_EXE,) + args[1:]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -92,14 +74,7 @@ async def _run_git(*args: str, cwd: str | None = None) -> Tuple[str, str, int]:
 
 
 async def _run_git_streaming(*args: str, cwd: str | None = None):
-    """Run a git command and yield stderr lines in real-time. Returns (returncode, all_stderr).
-
-    git writes progress to stderr (--progress), so we stream stderr line-by-line
-    so callers can forward progress events to the frontend without blocking.
-    Yields individual (non-empty) stderr lines as strings.
-    After iteration completes, the caller can check the return code from the
-    process object returned as the last yielded item (a special sentinel).
-    """
+    """Run a git command streaming stderr line-by-line, then yields a final (returncode, stdout, stderr) tuple."""
     resolved_args = (_GIT_EXE,) + args[1:]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -117,35 +92,28 @@ async def _run_git_streaming(*args: str, cwd: str | None = None):
     stderr_chunks: list[str] = []
     stdout_chunks: list[str] = []
 
-    # Stream stderr line-by-line (git clone --progress writes here)
-    # We must also drain stdout to avoid the process blocking on a full pipe.
     async def _drain_stdout():
         assert proc.stdout is not None
         raw = await proc.stdout.read()
         stdout_chunks.append(raw.decode(errors="replace"))
 
-    # Start draining stdout in background
     stdout_task = asyncio.create_task(_drain_stdout())
 
     assert proc.stderr is not None
-    # git uses \r for in-place progress updates (e.g. "Receiving objects: 42%")
-    # readline() only splits on \n. Read in chunks and split on both.
     buf = b""
     while True:
         chunk = await proc.stderr.read(256)
         if not chunk:
             break
         buf += chunk
-        # Split on both \r and \n
         parts = re.split(rb"[\r\n]", buf)
-        buf = parts.pop()  # keep last incomplete fragment
+        buf = parts.pop()
         for part in parts:
             line = part.decode(errors="replace").strip()
             if line:
                 stderr_chunks.append(line)
                 yield line
 
-    # Flush any remaining buffer
     if buf:
         line = buf.decode(errors="replace").strip()
         if line:
@@ -155,14 +123,11 @@ async def _run_git_streaming(*args: str, cwd: str | None = None):
     await stdout_task
     await proc.wait()
 
-    # Yield a sentinel tuple so caller can get returncode + full output
-    full_stderr = "\n".join(stderr_chunks)
-    full_stdout = "".join(stdout_chunks)
-    yield (proc.returncode or 0, full_stdout, full_stderr)
+    yield (proc.returncode or 0, "".join(stdout_chunks), "\n".join(stderr_chunks))
 
 
 async def check_git_available() -> str:
-    """Check if git is installed and return its version. Raises if not found."""
+    """Check if git is installed and return its version string. Raises if not found."""
     try:
         stdout, _, rc = await _run_git("git", "--version")
         if rc == 0:
@@ -178,7 +143,6 @@ async def check_git_available() -> str:
 
 
 def _dir_size_mb(path: Path) -> float:
-    """Total size of a directory in MB, following regular files only."""
     total = 0
     for f in path.rglob("*"):
         if f.is_file():
@@ -190,50 +154,27 @@ def _dir_size_mb(path: Path) -> float:
 
 
 async def clone_repo_streaming(repo_url: str):
-    """Clone a repo (shallow) or update if already exists, streaming progress.
+    """Clone (shallow) or update an existing clone, streaming progress strings.
 
-    Yields progress strings during the git clone, then finally yields a tuple
-    (repo_path, commit_hash) when done. Raises RuntimeError on failure.
-
-    Usage:
-        async for item in clone_repo_streaming(url):
-            if isinstance(item, tuple):
-                repo_path, commit_hash = item
-            else:
-                # item is a progress string — forward to the frontend
-                yield_to_sse(item)
+    Yields progress strings during the clone, then a final (repo_path, commit_hash) tuple.
     """
     repo_url = validate_repo_url(repo_url)
     repo_path = get_repo_path(repo_url)
 
-    # Check git is available before doing anything
     await check_git_available()
 
     if (repo_path / ".git").exists():
-        # Update existing clone — fetch + reset instead of pull
-        # (shallow clones often can't `git pull` due to missing tracking info)
         yield "Updating existing clone..."
         stdout, stderr, rc = await _run_git("git", "fetch", "--depth=1", "--quiet", cwd=str(repo_path))
         if rc == 0:
             await _run_git("git", "reset", "--hard", "FETCH_HEAD", "--quiet", cwd=str(repo_path))
         else:
-            # Fetch failed — log it but keep existing clone usable
             logger.warning(f"git fetch failed for {repo_url}: {stderr or stdout}")
-            # If the repo directory exists but is corrupted, try a fresh clone
             if not (repo_path / ".git" / "HEAD").exists():
                 logger.warning("Repo appears corrupted, removing for fresh clone")
                 shutil.rmtree(repo_path, ignore_errors=True)
-                # Fall through to fresh clone below
-            else:
-                # Keep existing clone — it's still usable
-                pass
 
     if not (repo_path / ".git").exists():
-        # Fresh shallow clone.
-        # We use the non-streaming _run_git (communicate-based) instead of
-        # _run_git_streaming because git suppresses --progress output when
-        # stderr is a pipe (not a real TTY), which causes read(256) to block
-        # forever on Windows waiting for bytes that never arrive.
         if repo_path.exists():
             shutil.rmtree(repo_path, ignore_errors=True)
 
@@ -241,7 +182,7 @@ async def clone_repo_streaming(repo_url: str):
 
         stdout, stderr, rc = await asyncio.wait_for(
             _run_git("git", "clone", "--depth", "1", repo_url, str(repo_path)),
-            timeout=300.0,  # 5 min hard limit
+            timeout=300.0,
         )
 
         if rc != 0:
@@ -267,43 +208,33 @@ async def clone_repo_streaming(repo_url: str):
 
         yield "Clone complete."
 
-    # Get current commit hash
     stdout, stderr, rc = await _run_git("git", "rev-parse", "HEAD", cwd=str(repo_path))
     if rc != 0:
-        # rev-parse failed — repo might be in a weird state
         logger.warning(f"git rev-parse failed: {stderr or stdout}")
         commit_hash = "unknown"
     else:
         commit_hash = stdout
 
-    # Verify the clone actually has files (not empty or corrupted)
     has_files = any(True for _ in repo_path.rglob("*") if _.is_file() and not _.name.startswith("."))
     if not has_files:
         logger.error(f"Cloned repo appears empty: {repo_path}")
         shutil.rmtree(repo_path, ignore_errors=True)
-        raise RuntimeError("Git clone succeeded but the repo directory is empty. The repository might be empty on GitHub.")
+        raise RuntimeError("Git clone succeeded but the repo directory is empty.")
 
-    # Enforce size limit — reject oversized repos to protect disk/CPU on shared hosts
     size_mb = _dir_size_mb(repo_path)
     if size_mb > config.MAX_REPO_SIZE_MB:
-        logger.warning(f"Repo {repo_url} is {size_mb:.0f}MB, exceeds limit of {config.MAX_REPO_SIZE_MB}MB. Rejecting.")
+        logger.warning(f"Repo {repo_url} is {size_mb:.0f}MB, exceeds limit of {config.MAX_REPO_SIZE_MB}MB")
         shutil.rmtree(repo_path, ignore_errors=True)
         raise RuntimeError(
             f"Repository is too large ({size_mb:.0f}MB, even shallow-cloned). "
-            f"This deployment supports repos up to {config.MAX_REPO_SIZE_MB}MB. "
-            f"Try a smaller repo or a specific subdirectory's repo."
+            f"This deployment supports repos up to {config.MAX_REPO_SIZE_MB}MB."
         )
 
-    # Final result — yield the tuple so the caller knows we're done
     yield (repo_path, commit_hash)
 
 
 async def clone_repo(repo_url: str) -> Tuple[Path, str]:
-    """Clone a repo (shallow) or update if already exists.
-    Returns (repo_path, commit_hash). Raises on failure.
-
-    Non-streaming wrapper around clone_repo_streaming for backward compat.
-    """
+    """Non-streaming wrapper around clone_repo_streaming."""
     result = None
     async for item in clone_repo_streaming(repo_url):
         if isinstance(item, tuple):

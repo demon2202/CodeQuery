@@ -1,18 +1,3 @@
-"""
-Repo API endpoints — uses lightweight snapshots instead of full git clones.
-
-After indexing, repos are replaced with SQLite snapshots that contain:
-- All source file contents (for file viewer and search enrichment)
-- File tree structure (for file tree sidebar)
-- Pre-computed stats (for repo summary)
-
-The snapshot approach saves 80-95% disk space by removing the .git folder
-and git objects, which are unnecessary after indexing.
-
-Fallback: If no snapshot exists (backward compatibility), endpoints still
-read from the filesystem.
-"""
-
 import json
 import logging
 import shutil
@@ -42,13 +27,7 @@ from ..store.chroma_store import get_store
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/repos", tags=["repos"])
 
-# ── Simple in-memory rate limiter for indexing ──────────────────────────────
-# A public "clone + index any GitHub repo" endpoint with no rate limit is an
-# easy way for one client to exhaust disk/CPU on a shared host. This is a
-# basic sliding-window limiter — fine for a single-process deployment (e.g.
-# one Render instance). It resets on restart and doesn't coordinate across
-# multiple processes/workers; if you scale to multiple workers, swap this for
-# a shared store (Redis) instead.
+# Sliding-window rate limiter — single process only; use Redis for multi-worker setups
 _index_requests: dict[str, deque] = defaultdict(deque)
 
 
@@ -62,10 +41,10 @@ def _check_rate_limit(client_ip: str) -> None:
     if len(window) >= config.INDEX_RATE_LIMIT_PER_MIN:
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded: max {config.INDEX_RATE_LIMIT_PER_MIN} repo indexing "
-                    f"requests per minute. Try again shortly.",
+            detail=f"Rate limit exceeded: max {config.INDEX_RATE_LIMIT_PER_MIN} repo indexing requests per minute.",
         )
     window.append(now)
+
 
 LANG_MAP = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript",
@@ -79,7 +58,7 @@ LANG_MAP = {
 
 @router.post("/index")
 async def index_repository(request: IndexRequest, http_request: Request):
-    """Index a repo. Returns SSE stream with real progress."""
+    """Index a repo. Returns SSE stream with real-time progress."""
     client_ip = http_request.client.host if http_request.client else "unknown"
     _check_rate_limit(client_ip)
 
@@ -120,16 +99,13 @@ async def get_file_content(
     start_line: Optional[int] = Query(None, ge=1),
     end_line: Optional[int] = Query(None, ge=1),
 ):
-    """Get file content for citation expansion. Reads from snapshot."""
-    # First-line defense: reject path traversal attempts
+    """Get file content for citation expansion."""
     if ".." in file_path or file_path.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid file path")
 
-    # Try snapshot first (fast — single SQLite query)
     data = get_snapshot_file(repo_url, file_path)
 
     if data is None:
-        # Fallback: read from filesystem (backward compatibility)
         repo_path = get_repo_path(repo_url).resolve()
         full_path = (repo_path / file_path).resolve()
         try:
@@ -152,7 +128,6 @@ async def get_file_content(
     if data is None:
         raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
 
-    # Apply line range
     total_lines = data["total_lines"]
     content = data["content"]
     language = data["language"]
@@ -180,13 +155,11 @@ async def delete_repo_index(repo_url: str = Query(...), delete_files: bool = Que
     except Exception as e:
         logger.warning(f"Failed to delete collection: {e}")
 
-    # Delete snapshot
     try:
         delete_snapshot(repo_url)
     except Exception as e:
         logger.warning(f"Failed to delete snapshot: {e}")
 
-    # Also delete any remaining repo files on disk (for backward compat)
     if delete_files:
         repo_path = get_repo_path(repo_url)
         if repo_path.exists():
@@ -201,12 +174,10 @@ async def delete_repo_index(repo_url: str = Query(...), delete_files: bool = Que
 
 @router.get("/tree")
 async def get_file_tree(repo_url: str = Query(...)):
-    """Get the file tree for a repo. Reads from snapshot."""
-    # Try snapshot first (instant — pre-computed JSON)
+    """Get the file tree for a repo."""
     tree = get_snapshot_tree(repo_url)
 
     if tree is None:
-        # Fallback: build from filesystem (backward compatibility)
         repo_path = get_repo_path(repo_url)
         if not repo_path.exists():
             raise HTTPException(status_code=404, detail="Repo not cloned and no snapshot found")
@@ -258,26 +229,22 @@ async def get_file_tree(repo_url: str = Query(...)):
 
 @router.get("/summary")
 async def get_repo_summary(repo_url: str = Query(...)):
-    """Generate a repo summary with stats and LLM overview. Uses pre-computed snapshot."""
+    """Generate a repo summary with stats and LLM overview."""
     store = get_store()
 
-    # Get collection stats
     try:
         db_stats = store.get_collection_stats(repo_url)
         chunk_count = db_stats["chunk_count"]
     except Exception:
         chunk_count = 0
 
-    # Try pre-computed stats from snapshot first
     snap_stats = get_snapshot_stats(repo_url)
 
     if snap_stats:
-        # Use pre-computed stats — update chunk_count from live DB
         languages = snap_stats.get("languages", [])
         file_count = snap_stats.get("files", 0)
         func_count = snap_stats.get("functions", 0)
     else:
-        # Fallback: compute from filesystem (backward compatibility)
         repo_path = get_repo_path(repo_url)
         lang_counts = {}
         file_count = 0
@@ -298,15 +265,11 @@ async def get_repo_summary(repo_url: str = Query(...)):
                     file_count += 1
 
         total_files = max(file_count, 1)
-        languages = []
-        for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1]):
-            languages.append({
-                "name": lang,
-                "files": count,
-                "pct": round(count / total_files * 100),
-            })
+        languages = [
+            {"name": lang, "files": count, "pct": round(count / total_files * 100)}
+            for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])
+        ]
 
-    # Count functions from chunks metadata
     if chunk_count > 0 and func_count == 0:
         try:
             collection = store._get_collection(repo_url)
@@ -330,13 +293,11 @@ async def get_repo_summary(repo_url: str = Query(...)):
         "text": None,
     }
 
-    # Try to get LLM summary
     if chunk_count > 0:
         try:
             collection = store._get_collection(repo_url)
             sample = collection.peek(limit=30)
             metas = sample.get("metadatas", [])
-            docs = sample.get("documents", [])
 
             file_list = sorted(set(m.get("file_path", "") for m in metas))[:20]
             func_list = [m.get("name", "") for m in metas if m.get("chunk_type") in ("function", "method") and m.get("name")][:15]
@@ -364,8 +325,7 @@ Overview:"""
                     },
                 )
                 if resp.status_code == 200:
-                    data = resp.json()
-                    text = data.get("response", "").strip()
+                    text = resp.json().get("response", "").strip()
                     if text:
                         result["text"] = text
         except Exception as e:

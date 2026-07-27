@@ -42,16 +42,13 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
   const inputRef = useRef(null);
   const messagesRef = useRef([]);
 
-  // Keep messagesRef in sync
   useEffect(() => { messagesRef.current = messages; }, [messages]);
 
-  // Handle "Ask about file" from FileTree
   useEffect(() => {
     if (askAboutFile && askAboutFile.path && !streaming) {
       const q = `Explain what ${askAboutFile.path} does and how it works`;
       setInput(q);
       inputRef.current?.focus();
-      // Auto-send after a brief moment
       setTimeout(() => {
         if (inputRef.current) {
           const form = inputRef.current.closest('form');
@@ -62,7 +59,6 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
     }
   }, [askAboutFile]);
 
-  // Fetch dynamic starters
   useEffect(() => {
     let cancelled = false;
     const fetchStarters = async () => {
@@ -99,7 +95,6 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
       { id: aid, role: 'assistant', content: '', sources: [], streaming: true },
     ]);
 
-    // Build conversation history from previous messages (last 4 Q&A pairs)
     const history = [];
     const completedMsgs = messagesRef.current.filter(m => !m.streaming && m.content);
     for (let i = 0; i < completedMsgs.length; i++) {
@@ -175,7 +170,6 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
     }
   }, [send]);
 
-  // Merge starters: show LLM ones if available, else file-based
   const displayStarters = llmStarters || starters;
 
   return (

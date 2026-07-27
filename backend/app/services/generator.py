@@ -1,19 +1,3 @@
-"""
-LLM answer generation service for CodeQuery.
-
-Uses Ollama for local generation with qwen2.5-coder:7b.
-Streams tokens from Ollama to the frontend via SSE.
-
-The prompt engineering is the most critical part of this service.
-Key design decisions:
-1. System prompt enforces structured, grounded answers with proper citations
-2. Chunks are formatted with clear headers so the LLM knows what each chunk is
-3. Citation format is strict: one citation per claim, inline in the text
-4. Mermaid diagrams must be detailed and specific (not generic 4-box diagrams)
-5. Chart JSON must be valid — strict format with example provided
-6. The LLM is told to ANALYZE all chunks first, then answer — not just dump the first one
-"""
-
 import json
 import logging
 from typing import AsyncGenerator, List
@@ -24,8 +8,6 @@ from .. import config
 from ..models import ChunkSource
 
 logger = logging.getLogger(__name__)
-
-# ── System Prompt ──────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are CodeQuery, an expert code analyst. You answer questions about codebases using ONLY the provided code chunks. You are thorough, specific, and produce well-structured answers with detailed diagrams.
 
@@ -173,7 +155,6 @@ Answer:"""
 
 
 def _format_history(history: list[dict] | None) -> str:
-    """Format conversation history for the prompt."""
     if not history:
         return ""
     recent = history[-4:]
@@ -192,29 +173,18 @@ def _format_history(history: list[dict] | None) -> str:
 
 def _format_chunks_for_prompt(sources: List[ChunkSource], documents: List[str]) -> str:
     """Format retrieved chunks into the prompt with clear, structured headers."""
-    # Build a file summary first so the LLM has context
-    file_set = set()
-    for source in sources:
-        file_set.add(source.file_path)
-
+    file_set = {source.file_path for source in sources}
     parts = []
 
-    # Detect continuation pieces: same file + same name + same chunk_type
-    # appearing more than once means one function/module block got split
-    # across multiple chunks purely for storage size limits. Track counts
-    # so we can label them "part X of Y" instead of letting the LLM think
-    # they're separate functions.
     key_counts: dict[tuple, int] = {}
     for s in sources:
         key = (s.file_path, s.name, s.chunk_type)
         key_counts[key] = key_counts.get(key, 0) + 1
     key_seen: dict[tuple, int] = {}
 
-    # File overview — helps the LLM understand the repo structure
     if file_set:
-        sorted_files = sorted(file_set)
         parts.append("FILES IN RETRIEVED CHUNKS:")
-        for f in sorted_files:
+        for f in sorted(file_set):
             chunks_in_file = [s for s in sources if s.file_path == f]
             names = []
             seen_names = set()
@@ -236,7 +206,6 @@ def _format_chunks_for_prompt(sources: List[ChunkSource], documents: List[str]) 
             parts.append(f"  {f}: {', '.join(names)}")
         parts.append("")
 
-    # Individual chunks with clear headers
     for i, (source, doc) in enumerate(zip(sources, documents)):
         location = f"{source.file_path}:{source.start_line}-{source.end_line}"
         key = (source.file_path, source.name, source.chunk_type)
@@ -270,22 +239,16 @@ async def generate_answer(
     history: list[dict] | None = None,
     unmatched_filenames: list[str] | None = None,
 ) -> AsyncGenerator[dict, None]:
-    """Generate an answer using Ollama, streaming tokens.
+    """Generate an answer using Ollama or Groq, streaming tokens.
 
     Yields:
-        {"type": "sources", "chunks": [...]} — the retrieved source chunks
-        {"type": "token", "text": "..."} — streamed answer tokens
-        {"type": "done", "answer": "..."} — complete answer
-        {"type": "error", "message": "..."} — if generation fails
+        {"type": "sources", "chunks": [...]}
+        {"type": "token", "text": "..."}
+        {"type": "done", "answer": "..."}
+        {"type": "error", "message": "..."}
     """
+    yield {"type": "sources", "chunks": [s.model_dump() for s in sources]}
 
-    # Send sources first so the UI can show citations immediately
-    yield {
-        "type": "sources",
-        "chunks": [s.model_dump() for s in sources],
-    }
-
-    # If no sources or all below threshold, skip LLM call
     if not sources:
         yield {
             "type": "done",
@@ -293,7 +256,6 @@ async def generate_answer(
         }
         return
 
-    # Build the prompt
     chunks_text = _format_chunks_for_prompt(sources, documents)
     history_section = _format_history(history)
 
@@ -314,7 +276,6 @@ async def generate_answer(
         history_section=history_section,
     ) + unmatched_note
 
-    # Call LLM (Groq or Ollama)
     full_answer = []
 
     if config.LLM_PROVIDER == "groq" or (config.GROQ_API_KEY and config.LLM_PROVIDER != "ollama"):
@@ -365,13 +326,9 @@ async def generate_answer(
             yield {"type": "done", "answer": "".join(full_answer)}
             return
         except Exception as e:
-            yield {
-                "type": "error",
-                "message": f"Groq generation failed: {e}",
-            }
+            yield {"type": "error", "message": f"Groq generation failed: {e}"}
             return
 
-    # Call Ollama streaming API
     try:
         async with httpx.AsyncClient(timeout=config.OLLAMA_TIMEOUT) as client:
             async with client.stream(
@@ -382,10 +339,7 @@ async def generate_answer(
                     "prompt": prompt,
                     "system": SYSTEM_PROMPT,
                     "stream": True,
-                    "options": {
-                        "temperature": 0.1,
-                        "num_predict": 4096,
-                    },
+                    "options": {"temperature": 0.1, "num_predict": 4096},
                 },
             ) as response:
                 if response.status_code != 200:
@@ -399,37 +353,25 @@ async def generate_answer(
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
-
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-
                     if data.get("done"):
                         break
-
                     token = data.get("response", "")
                     if token:
                         full_answer.append(token)
                         yield {"type": "token", "text": token}
 
     except httpx.ConnectError:
-        yield {
-            "type": "error",
-            "message": "Ollama is not running. Start it with: ollama serve",
-        }
+        yield {"type": "error", "message": "Ollama is not running. Start it with: ollama serve"}
         return
     except httpx.TimeoutException:
-        yield {
-            "type": "error",
-            "message": f"Ollama request timed out after {config.OLLAMA_TIMEOUT}s. The model may be loading — try again.",
-        }
+        yield {"type": "error", "message": f"Ollama request timed out after {config.OLLAMA_TIMEOUT}s. The model may be loading — try again."}
         return
     except Exception as e:
-        yield {
-            "type": "error",
-            "message": f"Generation failed: {e}",
-        }
+        yield {"type": "error", "message": f"Generation failed: {e}"}
         return
 
     yield {"type": "done", "answer": "".join(full_answer)}
@@ -455,33 +397,20 @@ async def check_ollama_health() -> dict:
             data = response.json()
             models = data.get("models", [])
             model_names = [m.get("name", "") for m in models]
-
             model_available = any(
                 config.OLLAMA_MODEL in name or name.startswith(config.OLLAMA_MODEL.split(":")[0])
                 for name in model_names
             )
 
-            return {
-                "running": True,
-                "model_available": model_available,
-                "models": model_names,
-            }
+            return {"running": True, "model_available": model_available, "models": model_names}
     except httpx.ConnectError:
-        return {
-            "running": False,
-            "model_available": False,
-            "error": "Cannot connect to Ollama",
-        }
+        return {"running": False, "model_available": False, "error": "Cannot connect to Ollama"}
     except Exception as e:
-        return {
-            "running": False,
-            "model_available": False,
-            "error": str(e),
-        }
+        return {"running": False, "model_available": False, "error": str(e)}
 
 
 async def warm_up_model() -> None:
-    """Warm up LLM model."""
+    """Warm up the LLM model."""
     if config.LLM_PROVIDER == "groq" or (config.GROQ_API_KEY and config.LLM_PROVIDER != "ollama"):
         logger.info(f"Using Groq API model: {config.GROQ_MODEL}")
         return
