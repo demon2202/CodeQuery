@@ -147,6 +147,29 @@ def _check_ollama_embed_available() -> bool:
 
 _st_model = None
 
+# fastembed requires fully-namespaced model IDs (e.g. "sentence-transformers/all-MiniLM-L6-v2"),
+# not bare names like "all-MiniLM-L6-v2". This maps common bare/legacy names people put in
+# config or env vars to the correct fastembed model ID, so a misconfigured EMBEDDING_MODEL
+# doesn't crash indexing in prod.
+_MODEL_NAME_ALIASES = {
+    "all-minilm-l6-v2": "sentence-transformers/all-MiniLM-L6-v2",
+    "bge-small-en-v1.5": "BAAI/bge-small-en-v1.5",
+    "bge-base-en-v1.5": "BAAI/bge-base-en-v1.5",
+}
+
+
+def _resolve_model_name(name: str) -> str:
+    if "/" in name:
+        return name
+    resolved = _MODEL_NAME_ALIASES.get(name.lower())
+    if resolved:
+        logger.warning(
+            f"EMBEDDING_MODEL='{name}' is not a valid fastembed model ID; "
+            f"using '{resolved}' instead. Update config/env to avoid this warning."
+        )
+        return resolved
+    return name
+
 
 def _get_st_model():
     """Get or load the fastembed ONNX model."""
@@ -156,9 +179,23 @@ def _get_st_model():
             from fastembed import TextEmbedding
         except ImportError:
             raise RuntimeError("fastembed is not installed. Run: pip install fastembed")
-        logger.info(f"Loading FastEmbed model: {config.EMBEDDING_MODEL}...")
+
+        model_name = _resolve_model_name(config.EMBEDDING_MODEL)
+
+        try:
+            supported = {m["model"] for m in TextEmbedding.list_supported_models()}
+        except Exception:
+            supported = None
+
+        if supported is not None and model_name not in supported:
+            raise RuntimeError(
+                f"Embedding model '{model_name}' is not supported by fastembed. "
+                f"Supported models: {sorted(supported)}"
+            )
+
+        logger.info(f"Loading FastEmbed model: {model_name}...")
         cache_dir = str(config.DATA_DIR / "fastembed_cache")
-        _st_model = TextEmbedding(model_name=config.EMBEDDING_MODEL, cache_dir=cache_dir)
+        _st_model = TextEmbedding(model_name=model_name, cache_dir=cache_dir)
         logger.info("FastEmbed model loaded.")
     return _st_model
 
