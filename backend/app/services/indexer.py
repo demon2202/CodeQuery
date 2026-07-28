@@ -23,7 +23,7 @@ from .snapshot import create_snapshot
 
 logger = logging.getLogger(__name__)
 
-EMBED_BATCH_SIZE = 64
+EMBED_BATCH_SIZE = 32  # lowered from 64 — smaller batches = smaller memory spikes
 
 
 def _build_file_tree(repo_path: Path) -> dict:
@@ -192,42 +192,50 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
     # 6. Pre-compute stats
     stats = _build_repo_stats(file_lang_pairs, all_chunks, len(all_chunks))
 
-    # 7. Embed
+    # 7 & 8. Embed AND store in the SAME batch loop.
+    #
+    # Previously this was two separate passes: one that embedded every chunk in
+    # the repo and accumulated `all_embeddings` for the ENTIRE repo, then a second
+    # pass that stored them. That meant the process held chunk text + embeddings
+    # for the whole repo in memory at once — on top of the ONNX runtime — which
+    # was OOM-killing the Render instance (exit code 137) on anything but small
+    # repos. Now each batch is embedded, immediately stored, then discarded
+    # before moving to the next batch, so peak memory is ~1 batch worth of
+    # embeddings instead of the whole repo's worth.
     total_chunks = len(all_chunks)
     yield {"type": "progress", "stage": "embedding", "current": 0, "total": total_chunks}
-    all_embeddings: list[list[float]] = []
 
     for i in range(0, total_chunks, EMBED_BATCH_SIZE):
         chunk_batch = all_chunks[i: i + EMBED_BATCH_SIZE]
-        batch = [f"{c.file_path}\n{c.content}" for c in chunk_batch]
+        texts = [f"{c.file_path}\n{c.content}" for c in chunk_batch]
+
         try:
-            embeddings = await loop.run_in_executor(None, encode_batch, batch)
-            all_embeddings.extend(embeddings)
+            embeddings = await loop.run_in_executor(None, encode_batch, texts)
         except Exception as e:
             yield {"type": "error", "message": f"Embedding failed: {e}"}
             return
-        yield {"type": "progress", "stage": "embedding", "current": min(i + EMBED_BATCH_SIZE, total_chunks), "total": total_chunks}
 
-    # 8. Store in ChromaDB
-    yield {"type": "progress", "stage": "storing", "current": 0, "total": total_chunks}
-    store_batch = 500
-    for i in range(0, total_chunks, store_batch):
-        batch_c = all_chunks[i: i + store_batch]
-        batch_e = all_embeddings[i: i + store_batch]
         try:
             await loop.run_in_executor(
                 None,
                 store.add_chunks,
                 repo_url,
-                [c.chunk_id for c in batch_c],
-                [c.content for c in batch_c],
-                batch_e,
-                [c.to_metadata() for c in batch_c],
+                [c.chunk_id for c in chunk_batch],
+                [c.content for c in chunk_batch],
+                embeddings,
+                [c.to_metadata() for c in chunk_batch],
             )
         except Exception as e:
             yield {"type": "error", "message": f"Storage failed: {e}"}
             return
-        yield {"type": "progress", "stage": "storing", "current": min(i + store_batch, total_chunks), "total": total_chunks}
+
+        # Explicitly drop references so this batch's memory can be freed
+        # before the next iteration allocates a new one.
+        del embeddings, texts, chunk_batch
+
+        done = min(i + EMBED_BATCH_SIZE, total_chunks)
+        yield {"type": "progress", "stage": "embedding", "current": done, "total": total_chunks}
+        yield {"type": "progress", "stage": "storing", "current": done, "total": total_chunks}
 
     try:
         store.set_commit_hash(repo_url, commit_hash)
