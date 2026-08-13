@@ -12,11 +12,15 @@ services:
     buildCommand: |
       pip install -r requirements.txt &&
       python -c "
-      import os; os.environ['FASTEMBED_CACHE_DIR']='/opt/render/project/src/.fastembed_cache';
       from fastembed import TextEmbedding;
+      cache = '/opt/render/project/src/.fastembed_cache';
       print('Downloading all-MiniLM-L6-v2 ONNX model...');
-      TextEmbedding('sentence-transformers/all-MiniLM-L6-v2');
-      print('FastEmbed model cached.')
+      TextEmbedding(
+          model_name='sentence-transformers/all-MiniLM-L6-v2',
+          cache_dir=cache,
+          threads=1,
+      );
+      print(f'FastEmbed model cached at {cache}.')
       "
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
 
@@ -38,7 +42,35 @@ services:
       - key: CQ_EMBEDDING_PROVIDER
         value: sentence-transformers
       - key: CQ_EMBEDDING_MODEL
-        value: all-MiniLM-L6-v2  # ~90MB RAM — safe on free tier. DO NOT use jina here (1.3GB -> OOM kill)
+        value: sentence-transformers/all-MiniLM-L6-v2  # Small ONNX model; do not use Jina on 512 MB.
+
+      # Keep both the outer indexer batch and FastEmbed's internal batch small.
+      - key: CQ_EMBEDDING_BATCH_SIZE
+        value: "8"
+      - key: CQ_FASTEMBED_THREADS
+        value: "1"
+      - key: CQ_RERANK_ENABLED
+        value: "false"
+
+      # Prevent BLAS/ONNX dependencies from creating large thread pools.
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: NUMEXPR_NUM_THREADS
+        value: "1"
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+
+      # Reject very large repositories before the clone and index exhaust RAM.
+      - key: CQ_MAX_REPO_SIZE_MB
+        value: "150"
+
+      # Only the production Vercel frontend may call the public API from a browser.
+      - key: ALLOWED_ORIGINS
+        value: https://codequery-eight.vercel.app
 
       # Data directory — /tmp/data is writable on Render free tier.
       # Data is lost on restart (ephemeral), but that's acceptable here.

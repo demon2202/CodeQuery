@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import shutil
@@ -29,6 +30,11 @@ router = APIRouter(prefix="/api/repos", tags=["repos"])
 
 # Sliding-window rate limiter — single process only; use Redis for multi-worker setups
 _index_requests: dict[str, deque] = defaultdict(deque)
+
+# Indexing loads the parser, ONNX model, and Chroma HNSW structures at the same
+# time. Only allow one indexing stream per worker so two requests cannot double
+# the peak memory usage on a 512 MB Render instance.
+_index_lock = asyncio.Lock()
 
 
 def _check_rate_limit(client_ip: str) -> None:
@@ -62,18 +68,47 @@ async def index_repository(request: IndexRequest, http_request: Request):
     client_ip = http_request.client.host if http_request.client else "unknown"
     _check_rate_limit(client_ip)
 
+    if _index_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="Another repository is currently being indexed. Try again when it finishes.",
+        )
+    await _index_lock.acquire()
+
     async def event_stream():
+        last_stage = None
         try:
             async for event in index_repo(request.repo_url):
+                stage = event.get("stage")
+                if stage and stage != last_stage:
+                    logger.info("Indexing %s entered stage: %s", request.repo_url, stage)
+                    last_stage = stage
+                if stage == "cloning" and event.get("message"):
+                    logger.info("Clone progress: %s", event["message"])
+                if event.get("type") in {"complete", "error"}:
+                    logger.info(
+                        "Indexing %s finished with event: %s",
+                        request.repo_url,
+                        event.get("type"),
+                    )
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.exception("Indexing error")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        finally:
+            _index_lock.release()
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            # Prevent GZipMiddleware and reverse proxies from buffering SSE
+            # progress events until indexing has nearly finished.
+            "Content-Encoding": "identity",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

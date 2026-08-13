@@ -24,6 +24,14 @@ OLLAMA_MODEL = os.getenv("CQ_OLLAMA_MODEL", "qwen2.5-coder:7b")
 OLLAMA_TIMEOUT = int(os.getenv("CQ_OLLAMA_TIMEOUT", "120"))
 OLLAMA_WARMUP_TIMEOUT = int(os.getenv("CQ_OLLAMA_WARMUP_TIMEOUT", "120"))
 
+# Local Ollama lifecycle. Auto-start is only attempted when CQ_OLLAMA_URL points
+# at this machine; remote Ollama endpoints are never used to launch processes.
+OLLAMA_AUTO_START = os.getenv("CQ_OLLAMA_AUTO_START", "true").lower() == "true"
+OLLAMA_START_TIMEOUT = int(os.getenv("CQ_OLLAMA_START_TIMEOUT", "30"))
+# Loading a large LLM can block FastAPI startup for minutes. Leave it lazy by
+# default; set this to true to warm it in the background after the API is ready.
+OLLAMA_WARMUP_ON_STARTUP = os.getenv("CQ_OLLAMA_WARMUP_ON_STARTUP", "false").lower() == "true"
+
 # Embedding — "ollama" (GPU, code-aware) or "sentence-transformers" (ONNX/CPU fallback)
 EMBEDDING_PROVIDER = os.getenv("CQ_EMBEDDING_PROVIDER", "ollama")
 OLLAMA_EMBED_MODEL = os.getenv("CQ_OLLAMA_EMBED_MODEL", "nomic-embed-text")
@@ -73,6 +81,8 @@ QUERY_REWRITE_LLM_ENABLED = os.getenv("CQ_QUERY_REWRITE_LLM_ENABLED", "false").l
 
 # Indexing limits
 MAX_REPO_SIZE_MB = int(os.getenv("CQ_MAX_REPO_SIZE_MB", "300"))
+GIT_COMMAND_TIMEOUT = int(os.getenv("CQ_GIT_COMMAND_TIMEOUT", "90"))
+GIT_CLONE_TIMEOUT = int(os.getenv("CQ_GIT_CLONE_TIMEOUT", "300"))
 INDEX_RATE_LIMIT_PER_MIN = int(os.getenv("CQ_INDEX_RATE_LIMIT_PER_MIN", "3"))
 INDEX_RATE_LIMIT_ENABLED = os.getenv("CQ_INDEX_RATE_LIMIT_ENABLED", "true").lower() == "true"
 

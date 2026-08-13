@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import os
 from typing import List
 
 import httpx
@@ -193,9 +194,22 @@ def _get_st_model():
                 f"Supported models: {sorted(supported)}"
             )
 
-        logger.info(f"Loading FastEmbed model: {model_name}...")
-        cache_dir = str(config.DATA_DIR / "fastembed_cache")
-        _st_model = TextEmbedding(model_name=model_name, cache_dir=cache_dir)
+        cache_dir = os.getenv(
+            "FASTEMBED_CACHE_DIR",
+            str(config.DATA_DIR / "fastembed_cache"),
+        )
+        threads = max(1, int(os.getenv("CQ_FASTEMBED_THREADS", "1")))
+        os.makedirs(cache_dir, exist_ok=True)
+
+        logger.info(
+            f"Loading FastEmbed model: {model_name} "
+            f"(cache={cache_dir}, threads={threads})..."
+        )
+        _st_model = TextEmbedding(
+            model_name=model_name,
+            cache_dir=cache_dir,
+            threads=threads,
+        )
         logger.info("FastEmbed model loaded.")
     return _st_model
 

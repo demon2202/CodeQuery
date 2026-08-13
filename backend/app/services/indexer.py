@@ -23,7 +23,10 @@ from .snapshot import create_snapshot
 
 logger = logging.getLogger(__name__)
 
-EMBED_BATCH_SIZE = 32  # lowered from 64 — smaller batches = smaller memory spikes
+# Keep the outer indexer batch aligned with FastEmbed's configured batch size.
+# This prevents the indexer from retaining 32 texts/embeddings when a low-memory
+# deployment has explicitly requested a smaller batch (for example, 8 on Render).
+EMBED_BATCH_SIZE = max(1, config.EMBEDDING_BATCH_SIZE)
 
 
 def _build_file_tree(repo_path: Path) -> dict:

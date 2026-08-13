@@ -40,20 +40,16 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
   const [stage, setStage] = useState('cloning');
   const [current, setCurrent] = useState(0);
   const [total, setTotal] = useState(0);
-  const [message, setMessage] = useState('');
+  const [message, setMessage] = useState('Connecting to the backend…');
   const [cloneDetail, setCloneDetail] = useState('');
   const [log, setLog] = useState([]);
   const [cancelling, setCancelling] = useState(false);
   const [stalled, setStalled] = useState(false);
-  const startedRef = useRef(false);
   const abortRef = useRef(null);
   const lastEventRef = useRef(Date.now());
   const terminalReceivedRef = useRef(false);
 
   useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -138,9 +134,15 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
       }
     };
 
-    startIndexing();
+    // Defer the request by one event-loop turn. In React development mode,
+    // StrictMode intentionally runs an effect's setup/cleanup once before the
+    // real setup. The throwaway cleanup cancels this timer, so only the real
+    // setup starts an indexing request. A persistent `started` ref would skip
+    // that real request and leave the UI at "Connecting to the backend…".
+    const startTimer = setTimeout(startIndexing, 0);
 
     return () => {
+      clearTimeout(startTimer);
       controller.abort();
       clearInterval(stallTimer);
     };
@@ -198,7 +200,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
 
         {stalled && (
           <p className="index-stall-hint">
-            This is taking a while.
+            No progress event for 20 seconds. Check the backend terminal for a Git or network timeout.
           </p>
         )}
 

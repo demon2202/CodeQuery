@@ -54,23 +54,91 @@ def get_repo_path(repo_url: str) -> Path:
     return config.REPOS_DIR / safe_name
 
 
-async def _run_git(*args: str, cwd: str | None = None) -> Tuple[str, str, int]:
-    """Run a git command. Returns (stdout, stderr, returncode)."""
+async def _run_git(
+    *args: str,
+    cwd: str | None = None,
+    timeout: float | None = None,
+) -> Tuple[str, str, int]:
+    """Run a non-interactive git command with a hard timeout."""
     resolved_args = (_GIT_EXE,) + args[1:]
+    command_timeout = timeout or config.GIT_COMMAND_TIMEOUT
+    env = os.environ.copy()
+    # A web request must never hang behind an invisible Git credential prompt.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *resolved_args,
             cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
-        return stdout.decode().strip(), stderr.decode().strip(), proc.returncode or 0
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=max(1.0, command_timeout),
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
+            return (
+                "",
+                f"git command timed out after {command_timeout:.0f}s: "
+                f"{' '.join(resolved_args[1:3])}",
+                124,
+            )
+        except asyncio.CancelledError:
+            # Disconnecting/cancelling an indexing stream must not leave an
+            # orphaned git.exe running in the background.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
+            raise
+        return (
+            stdout.decode(errors="replace").strip(),
+            stderr.decode(errors="replace").strip(),
+            proc.returncode or 0,
+        )
     except FileNotFoundError:
         raise RuntimeError(
             f"git not found at '{_GIT_EXE}'. "
             "Please install Git: https://git-scm.com/downloads"
         )
+
+
+async def _run_git_with_heartbeats(
+    *args: str,
+    cwd: str | None = None,
+    timeout: float | None = None,
+    status: str,
+):
+    """Yield status heartbeats while a git command runs, then its result tuple."""
+    task = asyncio.create_task(_run_git(*args, cwd=cwd, timeout=timeout))
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=5.0)
+            if task in done:
+                yield task.result()
+                return
+            elapsed = int(loop.time() - started)
+            yield f"{status} ({elapsed}s elapsed)..."
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 async def _run_git_streaming(*args: str, cwd: str | None = None):
@@ -165,14 +233,41 @@ async def clone_repo_streaming(repo_url: str):
 
     if (repo_path / ".git").exists():
         yield "Updating existing clone..."
-        stdout, stderr, rc = await _run_git("git", "fetch", "--depth=1", "--quiet", cwd=str(repo_path))
+        fetch_result = None
+        async for item in _run_git_with_heartbeats(
+            "git",
+            "fetch",
+            "--depth=1",
+            "--quiet",
+            cwd=str(repo_path),
+            timeout=config.GIT_COMMAND_TIMEOUT,
+            status="Still updating the existing clone",
+        ):
+            if isinstance(item, tuple):
+                fetch_result = item
+            else:
+                yield item
+
+        if fetch_result is None:
+            raise RuntimeError("git fetch ended without a result")
+        stdout, stderr, rc = fetch_result
         if rc == 0:
-            await _run_git("git", "reset", "--hard", "FETCH_HEAD", "--quiet", cwd=str(repo_path))
+            _, reset_stderr, reset_rc = await _run_git(
+                "git",
+                "reset",
+                "--hard",
+                "FETCH_HEAD",
+                "--quiet",
+                cwd=str(repo_path),
+            )
+            if reset_rc != 0:
+                raise RuntimeError(f"git reset failed: {reset_stderr}")
         else:
             logger.warning(f"git fetch failed for {repo_url}: {stderr or stdout}")
-            if not (repo_path / ".git" / "HEAD").exists():
-                logger.warning("Repo appears corrupted, removing for fresh clone")
-                shutil.rmtree(repo_path, ignore_errors=True)
+            # A timeout or failed update may leave stale lock files. Remove the
+            # clone and retry once from scratch instead of hanging every retry.
+            logger.warning("Removing the failed existing clone for a fresh clone")
+            shutil.rmtree(repo_path, ignore_errors=True)
 
     if not (repo_path / ".git").exists():
         if repo_path.exists():
@@ -180,10 +275,26 @@ async def clone_repo_streaming(repo_url: str):
 
         yield "Cloning repository (may take 30-60s for large repos)..."
 
-        stdout, stderr, rc = await asyncio.wait_for(
-            _run_git("git", "clone", "--depth", "1", repo_url, str(repo_path)),
-            timeout=300.0,
-        )
+        clone_result = None
+        async for item in _run_git_with_heartbeats(
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--progress",
+            repo_url,
+            str(repo_path),
+            timeout=config.GIT_CLONE_TIMEOUT,
+            status="Still cloning from GitHub",
+        ):
+            if isinstance(item, tuple):
+                clone_result = item
+            else:
+                yield item
+
+        if clone_result is None:
+            raise RuntimeError("git clone ended without a result")
+        stdout, stderr, rc = clone_result
 
         if rc != 0:
             shutil.rmtree(repo_path, ignore_errors=True)
@@ -201,7 +312,7 @@ async def clone_repo_streaming(repo_url: str):
                 msg += "\n\nThe repository doesn't exist or is private. Only public repos are supported."
             elif "permission denied" in lower_msg:
                 msg += "\n\nPermission denied. Check if the repo directory is accessible."
-            elif "timeout" in lower_msg:
+            elif "timeout" in lower_msg or "timed out" in lower_msg:
                 msg += "\n\nNetwork timeout. Try again or check your connection."
 
             raise RuntimeError(msg)
