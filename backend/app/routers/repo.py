@@ -23,6 +23,7 @@ from ..services.snapshot import (
     delete_snapshot,
     get_dir_names,
 )
+from ..services.generator import generate_simple
 from ..store.chroma_store import get_store
 
 logger = logging.getLogger(__name__)
@@ -349,21 +350,13 @@ Classes: {', '.join(class_list)}
 
 Overview:"""
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    f"{config.OLLAMA_BASE_URL}/api/generate",
-                    json={
-                        "model": config.OLLAMA_MODEL,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"temperature": 0.3, "num_predict": 300},
-                    },
-                )
-                if resp.status_code == 200:
-                    text = resp.json().get("response", "").strip()
-                    if text:
-                        result["text"] = text
+            try:
+                summary_text = await generate_simple(prompt, max_tokens=300)
+                if summary_text:
+                    result["text"] = summary_text
+            except Exception as e:
+                logger.debug(f"LLM summary generation failed: {e}")
         except Exception as e:
-            logger.debug(f"LLM summary failed (non-critical): {e}")
+            logger.debug(f"Repo summary extraction failed (non-critical): {e}")
 
     return result

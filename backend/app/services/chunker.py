@@ -10,12 +10,10 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
 
-import tree_sitter_python as tspython
-import tree_sitter_javascript as tsjavascript
-import tree_sitter_typescript as tstypescript
-from tree_sitter import Language, Parser, Node
+import logging
+logger = logging.getLogger(__name__)
 
 from .. import config
 
@@ -48,33 +46,53 @@ class CodeChunk:
         }
 
 
-_LANG_CONFIGS = {
-    "python": {
-        "lang": lambda: Language(tspython.language()),
-        "chunk_types": {"function_definition", "class_definition"},
-        "decorator_wrapper": "decorated_definition",
-        "body_types": {"block"},
-    },
-    "javascript": {
-        "lang": lambda: Language(tsjavascript.language()),
-        "chunk_types": {
-            "function_declaration", "class_declaration", "method_definition",
-            "arrow_function", "variable_declarator",
-        },
-        "decorator_wrapper": None,
-        "body_types": {"class_body", "statement_block"},
-    },
-    "typescript": {
-        "lang": lambda: Language(tstypescript.language_typescript()),
-        "chunk_types": {
-            "function_declaration", "class_declaration", "method_definition",
-            "interface_declaration", "type_alias_declaration", "enum_declaration",
-            "arrow_function", "variable_declarator", "public_field_definition",
-        },
-        "decorator_wrapper": None,
-        "body_types": {"class_body", "statement_block", "interface_body"},
-    },
-}
+_LANG_CONFIGS = {}
+
+try:
+    from tree_sitter import Language, Parser
+
+    try:
+        import tree_sitter_python as tspython
+        _LANG_CONFIGS["python"] = {
+            "lang": lambda: Language(tspython.language()),
+            "chunk_types": {"function_definition", "class_definition"},
+            "decorator_wrapper": "decorated_definition",
+            "body_types": {"block"},
+        }
+    except ImportError:
+        logger.info("tree-sitter-python not installed; falling back to sliding-window for Python.")
+
+    try:
+        import tree_sitter_javascript as tsjavascript
+        _LANG_CONFIGS["javascript"] = {
+            "lang": lambda: Language(tsjavascript.language()),
+            "chunk_types": {
+                "function_declaration", "class_declaration", "method_definition",
+                "arrow_function", "variable_declarator",
+            },
+            "decorator_wrapper": None,
+            "body_types": {"class_body", "statement_block"},
+        }
+    except ImportError:
+        logger.info("tree-sitter-javascript not installed; falling back to sliding-window for JavaScript.")
+
+    try:
+        import tree_sitter_typescript as tstypescript
+        _LANG_CONFIGS["typescript"] = {
+            "lang": lambda: Language(tstypescript.language_typescript()),
+            "chunk_types": {
+                "function_declaration", "class_declaration", "method_definition",
+                "interface_declaration", "type_alias_declaration", "enum_declaration",
+                "arrow_function", "variable_declarator", "public_field_definition",
+            },
+            "decorator_wrapper": None,
+            "body_types": {"class_body", "statement_block", "interface_body"},
+        }
+    except ImportError:
+        logger.info("tree-sitter-typescript not installed; falling back to sliding-window for TypeScript.")
+except ImportError:
+    logger.info("tree-sitter core not installed; falling back to sliding-window chunking.")
+
 
 
 def _is_only_comments(text: str) -> bool:
@@ -302,7 +320,7 @@ def _chunk_ast(source: str, rel_path: str, language: str) -> List[CodeChunk]:
     return final_chunks
 
 
-def _class_header_end(node: Node) -> int:
+def _class_header_end(node: Any) -> int:
     for body in node.children:
         if body.type in ("block", "class_body", "declaration_list"):
             for child in body.children:
@@ -313,7 +331,7 @@ def _class_header_end(node: Node) -> int:
     return min(node.end_point[0], node.start_point[0] + 15)
 
 
-def _node_name(node: Node) -> str | None:
+def _node_name(node: Any) -> str | None:
     name_node = node.child_by_field_name("name")
     return name_node.text.decode("utf8") if name_node else None
 

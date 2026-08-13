@@ -5,29 +5,28 @@ import os
 import re
 import shutil
 from pathlib import Path
+import subprocess
 from typing import Tuple
 
 from .. import config
 
 logger = logging.getLogger(__name__)
 
-_GIT_EXE: str = "git"
-
-_git_candidate = shutil.which("git")
-if _git_candidate:
-    _GIT_EXE = _git_candidate
-else:
-    _windows_fallbacks = [
+def _get_git_exe() -> str:
+    candidate = shutil.which("git")
+    if candidate:
+        return candidate
+    fallbacks = [
         r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files\Git\bin\git.exe",
         r"C:\Program Files (x86)\Git\cmd\git.exe",
         os.path.expanduser(r"~\AppData\Local\Programs\Git\cmd\git.exe"),
     ]
-    for _fb in _windows_fallbacks:
-        if os.path.isfile(_fb):
-            _GIT_EXE = _fb
-            break
+    for fb in fallbacks:
+        if os.path.isfile(fb):
+            return fb
+    return "git"
 
-logger.info(f"Git executable resolved to: {_GIT_EXE}")
 
 _SAFE_URL_RE = re.compile(
     r"^https?://(www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$"
@@ -54,70 +53,58 @@ def get_repo_path(repo_url: str) -> Path:
     return config.REPOS_DIR / safe_name
 
 
+def _sync_run_git(
+    args: list[str],
+    cwd: str | None = None,
+    timeout: float | None = None,
+) -> Tuple[str, str, int]:
+    git_exe = _get_git_exe()
+    resolved_args = [git_exe] + list(args[1:])
+    command_timeout = timeout or config.GIT_COMMAND_TIMEOUT
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    try:
+        res = subprocess.run(
+            resolved_args,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, command_timeout),
+            errors="replace",
+        )
+        return (res.stdout.strip(), res.stderr.strip(), res.returncode)
+    except subprocess.TimeoutExpired:
+        return (
+            "",
+            f"git command timed out after {command_timeout:.0f}s: {' '.join(resolved_args[1:3])}",
+            124,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"git not found at '{git_exe}'. "
+            "Please install Git: https://git-scm.com/downloads"
+        )
+    except Exception as e:
+        return ("", str(e), 1)
+
+
 async def _run_git(
     *args: str,
     cwd: str | None = None,
     timeout: float | None = None,
 ) -> Tuple[str, str, int]:
-    """Run a non-interactive git command with a hard timeout."""
-    resolved_args = (_GIT_EXE,) + args[1:]
-    command_timeout = timeout or config.GIT_COMMAND_TIMEOUT
-    env = os.environ.copy()
-    # A web request must never hang behind an invisible Git credential prompt.
-    env["GIT_TERMINAL_PROMPT"] = "0"
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *resolved_args,
-            cwd=cwd,
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=max(1.0, command_timeout),
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.communicate()
-            return (
-                "",
-                f"git command timed out after {command_timeout:.0f}s: "
-                f"{' '.join(resolved_args[1:3])}",
-                124,
-            )
-        except asyncio.CancelledError:
-            # Disconnecting/cancelling an indexing stream must not leave an
-            # orphaned git.exe running in the background.
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.communicate()
-            raise
-        return (
-            stdout.decode(errors="replace").strip(),
-            stderr.decode(errors="replace").strip(),
-            proc.returncode or 0,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"git not found at '{_GIT_EXE}'. "
-            "Please install Git: https://git-scm.com/downloads"
-        )
+    """Run a non-interactive git command safely using thread-backed subprocess."""
+    return await asyncio.to_thread(_sync_run_git, list(args), cwd, timeout)
 
 
 async def _run_git_with_heartbeats(
     *args: str,
     cwd: str | None = None,
     timeout: float | None = None,
-    status: str,
+    status: str = "",
 ):
     """Yield status heartbeats while a git command runs, then its result tuple."""
     task = asyncio.create_task(_run_git(*args, cwd=cwd, timeout=timeout))
@@ -143,71 +130,64 @@ async def _run_git_with_heartbeats(
 
 async def _run_git_streaming(*args: str, cwd: str | None = None):
     """Run a git command streaming stderr line-by-line, then yields a final (returncode, stdout, stderr) tuple."""
-    resolved_args = (_GIT_EXE,) + args[1:]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *resolved_args,
+    git_exe = _get_git_exe()
+    resolved_args = [git_exe] + list(args[1:])
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    def _start_proc():
+        return subprocess.Popen(
+            resolved_args,
             cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            bufsize=1,
         )
+
+    try:
+        proc = await asyncio.to_thread(_start_proc)
     except FileNotFoundError:
         raise RuntimeError(
-            f"git not found at '{_GIT_EXE}'. "
+            f"git not found at '{git_exe}'. "
             "Please install Git: https://git-scm.com/downloads"
         )
 
     stderr_chunks: list[str] = []
-    stdout_chunks: list[str] = []
 
-    async def _drain_stdout():
-        assert proc.stdout is not None
-        raw = await proc.stdout.read()
-        stdout_chunks.append(raw.decode(errors="replace"))
+    def _read_stderr_line():
+        return proc.stderr.readline()
 
-    stdout_task = asyncio.create_task(_drain_stdout())
+    def _read_stdout():
+        return proc.stdout.read()
 
-    assert proc.stderr is not None
-    buf = b""
     while True:
-        chunk = await proc.stderr.read(256)
-        if not chunk:
+        line = await asyncio.to_thread(_read_stderr_line)
+        if not line:
             break
-        buf += chunk
-        parts = re.split(rb"[\r\n]", buf)
-        buf = parts.pop()
-        for part in parts:
-            line = part.decode(errors="replace").strip()
-            if line:
-                stderr_chunks.append(line)
-                yield line
+        cleaned = line.strip()
+        if cleaned:
+            stderr_chunks.append(cleaned)
+            yield cleaned
 
-    if buf:
-        line = buf.decode(errors="replace").strip()
-        if line:
-            stderr_chunks.append(line)
-            yield line
+    stdout_text = await asyncio.to_thread(_read_stdout)
+    await asyncio.to_thread(proc.wait)
 
-    await stdout_task
-    await proc.wait()
-
-    yield (proc.returncode or 0, "".join(stdout_chunks), "\n".join(stderr_chunks))
+    yield (proc.returncode or 0, stdout_text or "", "\n".join(stderr_chunks))
 
 
 async def check_git_available() -> str:
     """Check if git is installed and return its version string. Raises if not found."""
-    try:
-        stdout, _, rc = await _run_git("git", "--version")
-        if rc == 0:
-            return stdout
-        raise RuntimeError("git command failed")
-    except RuntimeError as e:
-        if "not found" in str(e) or "not installed" in str(e):
-            raise
-        raise RuntimeError(
-            f"git not found at '{_GIT_EXE}'. "
-            "Please install Git: https://git-scm.com/downloads"
-        )
+    git_exe = _get_git_exe()
+    stdout, stderr, rc = await _run_git("git", "--version")
+    if rc == 0 and stdout:
+        return stdout
+    raise RuntimeError(
+        f"git not working at '{git_exe}': {stderr or stdout or f'exit code {rc}'}"
+    )
 
 
 def _dir_size_mb(path: Path) -> float:

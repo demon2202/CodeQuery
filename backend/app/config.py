@@ -32,17 +32,25 @@ OLLAMA_START_TIMEOUT = int(os.getenv("CQ_OLLAMA_START_TIMEOUT", "30"))
 # default; set this to true to warm it in the background after the API is ready.
 OLLAMA_WARMUP_ON_STARTUP = os.getenv("CQ_OLLAMA_WARMUP_ON_STARTUP", "false").lower() == "true"
 
-# Embedding — "ollama" (GPU, code-aware) or "sentence-transformers" (ONNX/CPU fallback)
+# Embedding — "ollama" (GPU, code-aware), "gemini" (free cloud API), or "sentence-transformers" (ONNX/FastEmbed)
 EMBEDDING_PROVIDER = os.getenv("CQ_EMBEDDING_PROVIDER", "ollama")
 OLLAMA_EMBED_MODEL = os.getenv("CQ_OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+# Gemini Embeddings (Free tier on Google AI Studio — 0 RAM usage on Render)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_EMBED_MODEL = os.getenv("CQ_GEMINI_EMBED_MODEL", "text-embedding-004")
 
 # fastembed model — requires full HuggingFace-style name (fastembed >= 0.4)
 # CQ_EMBEDDING_MODEL=jinaai/jina-embeddings-v2-base-code for better code retrieval
 # (uses ~1.3GB RAM — too heavy for Render free tier)
 EMBEDDING_MODEL = os.getenv("CQ_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-_default_batch_size = "16" if "jina" in EMBEDDING_MODEL.lower() else "64"
+_default_batch_size = "16" if "jina" in EMBEDDING_MODEL.lower() else "8"
 EMBEDDING_BATCH_SIZE = int(os.getenv("CQ_EMBEDDING_BATCH_SIZE", _default_batch_size))
+
+# Embedding cache toggle (disable to save RAM on 512MB instances)
+EMBED_CACHE_ENABLED = os.getenv("CQ_EMBED_CACHE_ENABLED", "false").lower() == "true"
+AUTO_CLEANUP_ON_RESET = os.getenv("CQ_AUTO_CLEANUP_ON_RESET", "true").lower() == "true"
 
 # Chunking
 MAX_CHUNK_CHARS = int(os.getenv("CQ_MAX_CHUNK_CHARS", "2000"))
@@ -59,6 +67,8 @@ if os.getenv("CQ_RETRIEVAL_MIN_SCORE") is not None:
     RETRIEVAL_MIN_SCORE = float(os.getenv("CQ_RETRIEVAL_MIN_SCORE"))
 elif _provider_explicitly_set and EMBEDDING_PROVIDER == "ollama" and "nomic" in OLLAMA_EMBED_MODEL.lower():
     RETRIEVAL_MIN_SCORE = 0.25
+elif _provider_explicitly_set and EMBEDDING_PROVIDER == "gemini":
+    RETRIEVAL_MIN_SCORE = 0.35
 elif "jina" in EMBEDDING_MODEL.lower():
     RETRIEVAL_MIN_SCORE = 0.30
 else:

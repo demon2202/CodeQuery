@@ -1,8 +1,10 @@
 """
-Indexing orchestrator: clone → walk → chunk → embed → store → snapshot → cleanup.
+Indexing orchestrator: clone → walk → streaming chunk & embed → store → snapshot.
+Refactored for ultra-low memory (<250MB) and keep-alive SSE heartbeats.
 """
 
 import asyncio
+import gc
 import logging
 import time
 from pathlib import Path
@@ -23,9 +25,6 @@ from .snapshot import create_snapshot
 
 logger = logging.getLogger(__name__)
 
-# Keep the outer indexer batch aligned with FastEmbed's configured batch size.
-# This prevents the indexer from retaining 32 texts/embeddings when a low-memory
-# deployment has explicitly requested a smaller batch (for example, 8 on Render).
 EMBED_BATCH_SIZE = max(1, config.EMBEDDING_BATCH_SIZE)
 
 
@@ -73,44 +72,13 @@ def _build_file_tree(repo_path: Path) -> dict:
     return build_tree(repo_path)
 
 
-def _build_repo_stats(
-    file_lang_pairs: list[tuple[Path, str]],
-    chunks: list[CodeChunk],
-    chunk_count: int,
-) -> dict:
-    lang_counts: dict[str, int] = {}
-    file_count = 0
-    func_count = 0
-
-    for _, lang in file_lang_pairs:
-        lang_counts[lang] = lang_counts.get(lang, 0) + 1
-        file_count += 1
-
-    for c in chunks:
-        if c.chunk_type in ("function", "method"):
-            func_count += 1
-
-    total_files = max(file_count, 1)
-    languages = [
-        {"name": lang, "files": count, "pct": round(count / total_files * 100)}
-        for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])
-    ]
-
-    return {
-        "files": file_count,
-        "chunks": chunk_count,
-        "functions": func_count,
-        "languages": languages[:8],
-    }
-
-
 async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
-    """Index a GitHub repo. Yields SSE-progress events."""
+    """Index a GitHub repo with streaming chunking & embedding to minimize memory usage."""
     start = time.time()
     store = get_store()
     loop = asyncio.get_event_loop()
 
-    # 1. Clone
+    # 1. Clone with heartbeats
     yield {"type": "progress", "stage": "cloning", "message": f"Cloning {repo_url}..."}
     repo_path = None
     commit_hash = None
@@ -123,7 +91,8 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
     except Exception as e:
         yield {"type": "error", "message": f"Clone failed: {e}"}
         return
-    yield {"type": "progress", "stage": "cloning", "message": f"Cloned (commit {commit_hash[:8]})"}
+
+    yield {"type": "progress", "stage": "cloning", "message": f"Cloned (commit {commit_hash[:8] if commit_hash else 'HEAD'})"}
 
     # 2. Check for incremental update
     old_hash = store.get_commit_hash(repo_url)
@@ -174,71 +143,100 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         return
     yield {"type": "progress", "stage": "walking", "message": f"Found {total_files} source files", "total": total_files}
 
-    # 4. Build file tree (while repo is on disk)
+    # 4. Build file tree
     tree = _build_file_tree(repo_path)
 
-    # 5. Parse into chunks
+    # 5, 6, 7 & 8: Streaming Parse → Embed → Store Pipeline
+    # Chunks are processed in small batches and released immediately to keep RAM < 250MB.
     yield {"type": "progress", "stage": "parsing", "current": 0, "total": total_files}
-    all_chunks: list[CodeChunk] = []
-    for i, (fp, lang) in enumerate(file_lang_pairs):
-        try:
-            all_chunks.extend(chunk_file(fp, repo_path, lang))
-        except Exception as e:
-            logger.warning(f"Parse error {fp}: {e}")
-        yield {"type": "progress", "stage": "parsing", "current": i + 1, "total": total_files}
 
-    if not all_chunks:
-        yield {"type": "error", "message": "No chunks extracted from repo"}
-        return
-    yield {"type": "progress", "stage": "parsing", "message": f"{total_files} files → {len(all_chunks)} chunks"}
+    lang_counts: dict[str, int] = {}
+    func_count = 0
+    total_chunks_indexed = 0
+    chunk_buffer: list[CodeChunk] = []
 
-    # 6. Pre-compute stats
-    stats = _build_repo_stats(file_lang_pairs, all_chunks, len(all_chunks))
+    for _, lang in file_lang_pairs:
+        lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
-    # 7 & 8. Embed AND store in the SAME batch loop.
-    #
-    # Previously this was two separate passes: one that embedded every chunk in
-    # the repo and accumulated `all_embeddings` for the ENTIRE repo, then a second
-    # pass that stored them. That meant the process held chunk text + embeddings
-    # for the whole repo in memory at once — on top of the ONNX runtime — which
-    # was OOM-killing the Render instance (exit code 137) on anything but small
-    # repos. Now each batch is embedded, immediately stored, then discarded
-    # before moving to the next batch, so peak memory is ~1 batch worth of
-    # embeddings instead of the whole repo's worth.
-    total_chunks = len(all_chunks)
-    yield {"type": "progress", "stage": "embedding", "current": 0, "total": total_chunks}
+    last_heartbeat = time.time()
 
-    for i in range(0, total_chunks, EMBED_BATCH_SIZE):
-        chunk_batch = all_chunks[i: i + EMBED_BATCH_SIZE]
-        texts = [f"{c.file_path}\n{c.content}" for c in chunk_batch]
+    async def _flush_chunk_buffer():
+        nonlocal chunk_buffer, total_chunks_indexed, last_heartbeat
+        if not chunk_buffer:
+            return
 
+        texts = [f"{c.file_path}\n{c.content}" for c in chunk_buffer]
         try:
             embeddings = await loop.run_in_executor(None, encode_batch, texts)
         except Exception as e:
-            yield {"type": "error", "message": f"Embedding failed: {e}"}
-            return
+            logger.error(f"Embedding batch failed: {e}")
+            raise
 
         try:
             await loop.run_in_executor(
                 None,
                 store.add_chunks,
                 repo_url,
-                [c.chunk_id for c in chunk_batch],
-                [c.content for c in chunk_batch],
+                [c.chunk_id for c in chunk_buffer],
+                [c.content for c in chunk_buffer],
                 embeddings,
-                [c.to_metadata() for c in chunk_batch],
+                [c.to_metadata() for c in chunk_buffer],
             )
         except Exception as e:
-            yield {"type": "error", "message": f"Storage failed: {e}"}
-            return
+            logger.error(f"Storage batch failed: {e}")
+            raise
 
-        # Explicitly drop references so this batch's memory can be freed
-        # before the next iteration allocates a new one.
-        del embeddings, texts, chunk_batch
+        total_chunks_indexed += len(chunk_buffer)
+        chunk_buffer = []
+        del texts, embeddings
+        gc.collect()
 
-        done = min(i + EMBED_BATCH_SIZE, total_chunks)
-        yield {"type": "progress", "stage": "embedding", "current": done, "total": total_chunks}
-        yield {"type": "progress", "stage": "storing", "current": done, "total": total_chunks}
+    try:
+        for i, (fp, lang) in enumerate(file_lang_pairs):
+            try:
+                file_chunks = chunk_file(fp, repo_path, lang)
+                for c in file_chunks:
+                    if c.chunk_type in ("function", "method"):
+                        func_count += 1
+                    chunk_buffer.append(c)
+
+                    if len(chunk_buffer) >= EMBED_BATCH_SIZE:
+                        await _flush_chunk_buffer()
+
+            except Exception as e:
+                logger.warning(f"Parse error in {fp}: {e}")
+
+            # Send progress update and keep-alive heartbeats
+            now = time.time()
+            if (i + 1) % 5 == 0 or (now - last_heartbeat) > 3.0 or (i + 1) == total_files:
+                last_heartbeat = now
+                yield {
+                    "type": "progress",
+                    "stage": "parsing",
+                    "current": i + 1,
+                    "total": total_files,
+                    "message": f"Processed {i + 1}/{total_files} files ({total_chunks_indexed + len(chunk_buffer)} chunks)",
+                }
+
+        # Flush any remaining chunks
+        if chunk_buffer:
+            await _flush_chunk_buffer()
+
+    except Exception as e:
+        yield {"type": "error", "message": f"Indexing pipeline error: {e}"}
+        return
+
+    if total_chunks_indexed == 0:
+        yield {"type": "error", "message": "No code chunks extracted from repository."}
+        return
+
+    yield {
+        "type": "progress",
+        "stage": "embedding",
+        "current": total_chunks_indexed,
+        "total": total_chunks_indexed,
+        "message": f"Embedded and stored {total_chunks_indexed} chunks successfully",
+    }
 
     try:
         store.set_commit_hash(repo_url, commit_hash)
@@ -251,22 +249,31 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         except Exception as e:
             logger.warning(f"Embed cache flush failed: {e}")
 
-    # 9. Snapshot + cleanup
-    yield {"type": "progress", "stage": "storing", "message": "Saving snapshot & cleaning up..."}
+    # Build final stats
+    languages = [
+        {"name": lang, "files": count, "pct": round(count / max(total_files, 1) * 100)}
+        for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])
+    ]
+    stats = {
+        "files": total_files,
+        "chunks": total_chunks_indexed,
+        "functions": func_count,
+        "languages": languages[:8],
+    }
+
+    # 9. Snapshot & final storage
+    yield {"type": "progress", "stage": "storing", "message": "Saving snapshot & finalizing index..."}
     try:
-        try:
-            db_stats = store.get_collection_stats(repo_url)
-            stats["chunks"] = db_stats["chunk_count"]
-        except Exception:
-            pass
         create_snapshot(repo_url, repo_path, tree, stats)
     except Exception as e:
         logger.warning(f"Snapshot creation failed (non-critical): {e}")
 
+    gc.collect()
+
     yield {
         "type": "complete",
         "files_indexed": total_files,
-        "chunks_created": total_chunks,
+        "chunks_created": total_chunks_indexed,
         "time_seconds": round(time.time() - start, 1),
         "commit_hash": commit_hash,
         "is_incremental": changed_files is not None,

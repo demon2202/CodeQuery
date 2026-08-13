@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 _health_cache = {"result": None, "timestamp": 0}
-_HEALTH_CACHE_TTL = 15.0
+_HEALTH_CACHE_TTL = 2.0
 
 _PATTERNS = [
     ("auth", ["How does authentication work?", "What auth middleware is used?"]),
@@ -216,7 +216,8 @@ async def health_check():
     git_ok = True
     try:
         await check_git_available()
-    except RuntimeError:
+    except Exception as e:
+        logger.warning(f"Health check git error: {e}")
         git_ok = False
 
     result = HealthResponse(

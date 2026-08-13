@@ -4,9 +4,9 @@ import { API_BASE } from '../config';
 const STAGES = [
   { key: 'cloning', label: 'Clone' },
   { key: 'walking', label: 'Scan' },
-  { key: 'parsing', label: 'Parse' },
+  { key: 'parsing', label: 'Parse & Index' },
   { key: 'embedding', label: 'Embed' },
-  { key: 'storing', label: 'Store' },
+  { key: 'storing', label: 'Finalize' },
 ];
 
 async function* readSSE(response) {
@@ -22,6 +22,10 @@ async function* readSSE(response) {
     buffer = lines.pop() || '';
 
     for (const line of lines) {
+      if (line.startsWith(':')) {
+        yield { type: 'heartbeat' };
+        continue;
+      }
       if (!line.startsWith('data: ')) continue;
       try {
         yield JSON.parse(line.slice(6));
@@ -34,7 +38,7 @@ async function* readSSE(response) {
   }
 }
 
-const STALL_HINT_MS = 20000;
+const STALL_HINT_MS = 25000;
 
 export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
   const [stage, setStage] = useState('cloning');
@@ -73,7 +77,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
         terminalReceivedRef.current = true;
         onProgress({
           type: 'error',
-          message: 'Cannot reach the backend server. Is it running?\n\nStart it in another terminal:\n  cd backend\n  uvicorn app.main:app --port 8000',
+          message: 'Cannot reach the backend server. If hosted on Render Free Tier, the server may be waking up from sleep (takes ~45-60s). Please try again.',
         });
         return;
       }
@@ -87,7 +91,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
           try {
             const text = await res.text();
             if (text.includes('ECONNREFUSED') || text.includes('proxy error')) {
-              detail = 'Backend server is not running. Start it with:\n  cd backend\n  uvicorn app.main:app --port 8000';
+              detail = 'Backend server is waking up or unreachable. Please wait a moment and try again.';
             }
           } catch {}
         }
@@ -100,6 +104,9 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
         for await (const event of readSSE(res)) {
           lastEventRef.current = Date.now();
           setStalled(false);
+          if (event.type === 'heartbeat') {
+            continue;
+          }
           if (event.type === 'complete' || event.type === 'error') {
             terminalReceivedRef.current = true;
           }
@@ -124,7 +131,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
         if (!terminalReceivedRef.current) {
           onProgress({
             type: 'error',
-            message: 'Connection to the server closed before indexing finished. This can happen on a slow network, a large repo, or if the server restarted mid-request. Try again — if it keeps happening, try a smaller repo.',
+            message: 'Connection closed unexpectedly. If on Render free tier, verify your configuration or check logs.',
           });
         }
       } catch (err) {
@@ -134,11 +141,6 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
       }
     };
 
-    // Defer the request by one event-loop turn. In React development mode,
-    // StrictMode intentionally runs an effect's setup/cleanup once before the
-    // real setup. The throwaway cleanup cancels this timer, so only the real
-    // setup starts an indexing request. A persistent `started` ref would skip
-    // that real request and leave the UI at "Connecting to the backend…".
     const startTimer = setTimeout(startIndexing, 0);
 
     return () => {
@@ -200,7 +202,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
 
         {stalled && (
           <p className="index-stall-hint">
-            No progress event for 20 seconds. Check the backend terminal for a Git or network timeout.
+            Waiting for backend response... If your Render instance is waking up, this may take up to a minute.
           </p>
         )}
 

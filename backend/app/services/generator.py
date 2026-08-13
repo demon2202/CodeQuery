@@ -429,3 +429,49 @@ async def warm_up_model() -> None:
             logger.info(f"Ollama model {config.OLLAMA_MODEL} warmed up")
     except Exception as e:
         logger.warning(f"Failed to warm up Ollama model: {e}")
+
+
+async def generate_simple(prompt: str, system: str = "", max_tokens: int = 300) -> str:
+    """Generate a non-streaming text response from Groq or Ollama."""
+    if config.LLM_PROVIDER == "groq" or (config.GROQ_API_KEY and config.LLM_PROVIDER != "ollama"):
+        headers = {
+            "Authorization": f"Bearer {config.GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": config.GROQ_MODEL,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+            raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:200]}")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{config.OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "system": system,
+                "stream": False,
+                "options": {"temperature": 0.3, "num_predict": max_tokens},
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json().get("response", "").strip()
+        raise RuntimeError(f"Ollama error {resp.status_code}: {resp.text[:200]}")

@@ -29,7 +29,7 @@ export default function App() {
   useEffect(() => { stateRef.current = state; }, [state]);
 
   useEffect(() => {
-    const handlePageHide = () => {
+    const handleCleanup = () => {
       const url = repoUrlRef.current;
       const keep = keepDataRef.current;
       const currentState = stateRef.current;
@@ -42,8 +42,12 @@ export default function App() {
         });
       } catch {}
     };
-    window.addEventListener('pagehide', handlePageHide);
-    return () => window.removeEventListener('pagehide', handlePageHide);
+    window.addEventListener('pagehide', handleCleanup);
+    window.addEventListener('beforeunload', handleCleanup);
+    return () => {
+      window.removeEventListener('pagehide', handleCleanup);
+      window.removeEventListener('beforeunload', handleCleanup);
+    };
   }, []);
 
   useEffect(() => {

@@ -77,3 +77,13 @@ services:
       - key: CQ_DATA_DIR
         value: /tmp/data
 
+      # Disable in-memory embedding cache to save RAM on 512MB free tier
+      - key: CQ_EMBED_CACHE_ENABLED
+        value: "false"
+      - key: CQ_AUTO_CLEANUP_ON_RESET
+        value: "true"
+
+      # Optional: To use Google Gemini Free Embeddings instead of FastEmbed:
+      # Set CQ_EMBEDDING_PROVIDER=gemini and GEMINI_API_KEY in Render environment
+
+

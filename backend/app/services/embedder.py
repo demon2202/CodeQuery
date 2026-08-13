@@ -13,12 +13,16 @@ logger = logging.getLogger(__name__)
 _CACHE_PATH = config.DATA_DIR / "embed_cache.json"
 _cache: dict[str, list] = {}
 _cache_dirty = False
+_MAX_CACHE_ENTRIES = 5000
 
 _MAX_EMBED_TEXT_LENGTH = 6000
 
 
 def _load_cache() -> None:
     global _cache, _cache_dirty
+    if not config.EMBED_CACHE_ENABLED:
+        _cache = {}
+        return
     if _cache:
         return
     if _CACHE_PATH.exists():
@@ -33,10 +37,15 @@ def _load_cache() -> None:
 
 
 def _save_cache() -> None:
-    global _cache_dirty
-    if not _cache_dirty:
+    global _cache_dirty, _cache
+    if not config.EMBED_CACHE_ENABLED or not _cache_dirty:
         return
     try:
+        if len(_cache) > _MAX_CACHE_ENTRIES:
+            # Keep only the newest entries to prevent memory creep
+            keys_to_keep = list(_cache.keys())[-_MAX_CACHE_ENTRIES:]
+            _cache = {k: _cache[k] for k in keys_to_keep}
+
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(_CACHE_PATH, "w") as f:
             json.dump(_cache, f)
@@ -57,6 +66,101 @@ def _sanitize_for_embed(text: str) -> str:
         text = text[:_MAX_EMBED_TEXT_LENGTH]
     return text
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini Free Embeddings (Cloud-based, 0 local RAM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gemini_embed_single(text: str) -> List[float]:
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set in environment.")
+    text = _sanitize_for_embed(text)
+    model = config.GEMINI_EMBED_MODEL
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={config.GEMINI_API_KEY}"
+    payload = {
+        "model": f"models/{model}",
+        "content": {"parts": [{"text": text}]},
+    }
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(url, json=payload)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini embed error {resp.status_code}: {resp.text[:300]}")
+        data = resp.json()
+        return data["embedding"]["values"]
+
+
+def _gemini_embed_batch(texts: List[str]) -> List[List[float]]:
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set in environment.")
+    _load_cache()
+
+    clean_texts = [_sanitize_for_embed(t) for t in texts]
+    all_embeddings = []
+    uncached_indices = []
+    uncached_texts = []
+
+    for i, text in enumerate(clean_texts):
+        h = _content_hash(text)
+        if config.EMBED_CACHE_ENABLED and h in _cache:
+            all_embeddings.append(_cache[h])
+        else:
+            all_embeddings.append(None)
+            uncached_indices.append(i)
+            uncached_texts.append(text)
+
+    if not uncached_texts:
+        return all_embeddings
+
+    model = config.GEMINI_EMBED_MODEL
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents?key={config.GEMINI_API_KEY}"
+
+    uncached_embeddings = []
+    batch_size = 20  # Gemini batch limit
+    batch_start = 0
+
+    with httpx.Client(timeout=60.0) as client:
+        while batch_start < len(uncached_texts):
+            batch = uncached_texts[batch_start:batch_start + batch_size]
+            requests = [
+                {"model": f"models/{model}", "content": {"parts": [{"text": t}]}}
+                for t in batch
+            ]
+            try:
+                resp = client.post(url, json={"requests": requests})
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Gemini batch embed error {resp.status_code}: {resp.text[:300]}")
+                data = resp.json()
+                for item in data.get("embeddings", []):
+                    uncached_embeddings.append(item["values"])
+                batch_start += len(batch)
+            except Exception as e:
+                logger.warning(f"Gemini batch embed error: {e}. Retrying sequentially...")
+                for item_text in batch:
+                    try:
+                        single_val = _gemini_embed_single(item_text)
+                        uncached_embeddings.append(single_val)
+                    except Exception as single_err:
+                        logger.error(f"Sequential Gemini embed failed: {single_err}")
+                        uncached_embeddings.append([0.0] * 768)
+                batch_start += len(batch)
+
+    global _cache_dirty
+    for j, idx in enumerate(uncached_indices):
+        emb = uncached_embeddings[j]
+        all_embeddings[idx] = emb
+        if config.EMBED_CACHE_ENABLED:
+            _cache[_content_hash(uncached_texts[j])] = emb
+            _cache_dirty = True
+
+    if config.EMBED_CACHE_ENABLED and _cache_dirty and len(uncached_texts) >= 10:
+        _save_cache()
+
+    return all_embeddings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ollama Embeddings
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _ollama_embed_single(text: str) -> List[float]:
     text = _sanitize_for_embed(text)
@@ -81,7 +185,7 @@ def _ollama_embed_batch(texts: List[str]) -> List[List[float]]:
 
     for i, text in enumerate(clean_texts):
         h = _content_hash(text)
-        if h in _cache:
+        if config.EMBED_CACHE_ENABLED and h in _cache:
             all_embeddings.append(_cache[h])
         else:
             all_embeddings.append(None)
@@ -121,10 +225,11 @@ def _ollama_embed_batch(texts: List[str]) -> List[List[float]]:
     for j, idx in enumerate(uncached_indices):
         emb = uncached_embeddings[j]
         all_embeddings[idx] = emb
-        _cache[_content_hash(uncached_texts[j])] = emb
-        _cache_dirty = True
+        if config.EMBED_CACHE_ENABLED:
+            _cache[_content_hash(uncached_texts[j])] = emb
+            _cache_dirty = True
 
-    if _cache_dirty and len(uncached_texts) >= 10:
+    if config.EMBED_CACHE_ENABLED and _cache_dirty and len(uncached_texts) >= 10:
         _save_cache()
 
     return all_embeddings
@@ -146,12 +251,12 @@ def _check_ollama_embed_available() -> bool:
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FastEmbed (ONNX) Ultra-Lean Model
+# ─────────────────────────────────────────────────────────────────────────────
+
 _st_model = None
 
-# fastembed requires fully-namespaced model IDs (e.g. "sentence-transformers/all-MiniLM-L6-v2"),
-# not bare names like "all-MiniLM-L6-v2". This maps common bare/legacy names people put in
-# config or env vars to the correct fastembed model ID, so a misconfigured EMBEDDING_MODEL
-# doesn't crash indexing in prod.
 _MODEL_NAME_ALIASES = {
     "all-minilm-l6-v2": "sentence-transformers/all-MiniLM-L6-v2",
     "bge-small-en-v1.5": "BAAI/bge-small-en-v1.5",
@@ -173,7 +278,7 @@ def _resolve_model_name(name: str) -> str:
 
 
 def _get_st_model():
-    """Get or load the fastembed ONNX model."""
+    """Get or load the fastembed ONNX model with low-memory configuration."""
     global _st_model
     if _st_model is None:
         try:
@@ -218,7 +323,8 @@ def _st_encode_batch(texts: List[str]) -> List[List[float]]:
     import numpy as np
     model = _get_st_model()
     clean = [_sanitize_for_embed(t) for t in texts]
-    embeddings = list(model.embed(clean, batch_size=config.EMBEDDING_BATCH_SIZE))
+    batch_size = max(1, config.EMBEDDING_BATCH_SIZE)
+    embeddings = list(model.embed(clean, batch_size=batch_size))
     return [e.tolist() if isinstance(e, np.ndarray) else list(e) for e in embeddings]
 
 
@@ -240,16 +346,22 @@ def _get_provider() -> str:
         return _provider
 
     requested = config.EMBEDDING_PROVIDER.lower().strip()
-    if requested == "ollama":
+    if requested == "gemini":
+        if config.GEMINI_API_KEY:
+            logger.info("Using Gemini Free Embeddings API")
+            _provider = "gemini"
+        else:
+            logger.warning("CQ_EMBEDDING_PROVIDER=gemini requested but GEMINI_API_KEY is not set. Falling back to FastEmbed.")
+            _provider = "sentence-transformers"
+    elif requested == "ollama":
         if _check_ollama_embed_available():
             logger.info(f"Using Ollama embeddings with {config.OLLAMA_EMBED_MODEL}")
             _provider = "ollama"
         else:
             logger.warning(
                 f"Ollama embedding model '{config.OLLAMA_EMBED_MODEL}' not found. "
-                f"Run: ollama pull {config.OLLAMA_EMBED_MODEL}"
+                f"Falling back to FastEmbed"
             )
-            logger.warning("Falling back to FastEmbed")
             _provider = "sentence-transformers"
     else:
         logger.info(f"Using FastEmbed (ONNX) embeddings with {config.EMBEDDING_MODEL}")
@@ -261,14 +373,25 @@ def _get_provider() -> str:
 def warm_up() -> None:
     _load_cache()
     provider = _get_provider()
-    if provider == "ollama":
+    if provider == "gemini":
+        try:
+            result = _gemini_embed_single("warm up")
+            logger.info(f"Gemini embeddings ready ({len(result)}-dim)")
+        except Exception as e:
+            logger.error(f"Gemini embedding test failed: {e}")
+            logger.warning("Falling back to FastEmbed")
+            global _provider
+            _provider = "sentence-transformers"
+            _get_st_model()
+            _st_encode_single("warm up")
+            logger.info("FastEmbed ready (fallback from Gemini)")
+    elif provider == "ollama":
         try:
             result = _ollama_embed_single("warm up")
             logger.info(f"Ollama embeddings ready ({len(result)}-dim)")
         except Exception as e:
             logger.error(f"Ollama embedding test failed: {e}")
             logger.warning("Falling back to FastEmbed")
-            global _provider
             _provider = "sentence-transformers"
             _get_st_model()
             _st_encode_single("warm up")
@@ -283,14 +406,18 @@ def encode_batch(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     provider = _get_provider()
-    if provider == "ollama":
+    if provider == "gemini":
+        return _gemini_embed_batch(texts)
+    elif provider == "ollama":
         return _ollama_embed_batch(texts)
     return _st_encode_batch(texts)
 
 
 def encode_single(text: str) -> List[float]:
     provider = _get_provider()
-    if provider == "ollama":
+    if provider == "gemini":
+        return _gemini_embed_single(text)
+    elif provider == "ollama":
         return _ollama_embed_single(text)
     return _st_encode_single(text)
 
