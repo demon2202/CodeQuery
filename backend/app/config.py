@@ -111,18 +111,45 @@ SKIP_DIRS = {
 }
 
 AST_EXTENSIONS = {
-    ".py": "python", ".js": "javascript", ".jsx": "javascript",
-    ".ts": "typescript", ".tsx": "typescript",
+    ".py": "python",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
 }
 
 TEXT_EXTENSIONS = {
-    ".c", ".h", ".cpp", ".cc", ".hpp", ".java", ".go", ".rs",
-    ".rb", ".php", ".swift", ".kt", ".scala", ".lua",
-    ".sh", ".bash", ".sql", ".graphql", ".proto",
-    ".html", ".css", ".scss", ".vue", ".svelte",
-    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
-    ".json", ".json5", ".jsonc",
-    ".md", ".rst", ".txt",
+    # Systems & Compiled languages
+    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh",
+    ".cs", ".java", ".go", ".rs", ".swift", ".kt", ".kts", ".scala",
+    ".clj", ".cljs", ".zig", ".nim", ".d", ".v", ".sv", ".vhdl",
+    ".hs", ".lhs", ".erl", ".hrl", ".ex", ".exs", ".elm", ".dart",
+    # Scripting & Interpreted
+    ".py", ".pyw", ".rb", ".rake", ".php", ".phtml", ".lua", ".pl", ".pm", ".t",
+    ".r", ".jl", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+    # Web & Templates
+    ".html", ".htm", ".xhtml", ".vue", ".svelte", ".astro", ".pug", ".jade",
+    ".css", ".scss", ".sass", ".less", ".styl",
+    # Data & Schemas
+    ".sql", ".prisma", ".graphql", ".gql", ".proto", ".thrift",
+    ".json", ".json5", ".jsonc", ".jsonld", ".geojson",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".properties",
+    # Documentation & Plain text
+    ".md", ".markdown", ".mdown", ".mkd", ".rst", ".txt", ".adoc", ".asciidoc",
+    ".tex", ".org", ".csv", ".tsv", ".log",
+    # WebAssembly & Smart Contracts
+    ".wat", ".wast", ".sol",
+}
+
+KNOWN_SOURCE_FILENAMES = {
+    "dockerfile", "containerfile", "makefile", "gnumakefile", "cmakelists.txt",
+    "procfile", "gemfile", "rakefile", "vagrantfile", "brewfile", "justfile",
+    "readme", "license", "licence", "notice", "changelog", "contributing",
+    "authors", "owners", "security", "code_of_conduct",
 }
 
 ALL_SOURCE_EXTENSIONS = set(AST_EXTENSIONS.keys()) | TEXT_EXTENSIONS

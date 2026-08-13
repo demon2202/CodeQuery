@@ -212,42 +212,46 @@ async def clone_repo_streaming(repo_url: str):
     await check_git_available()
 
     if (repo_path / ".git").exists():
-        yield "Updating existing clone..."
-        fetch_result = None
-        async for item in _run_git_with_heartbeats(
-            "git",
-            "fetch",
-            "--depth=1",
-            "--quiet",
-            cwd=str(repo_path),
-            timeout=config.GIT_COMMAND_TIMEOUT,
-            status="Still updating the existing clone",
-        ):
-            if isinstance(item, tuple):
-                fetch_result = item
-            else:
-                yield item
-
-        if fetch_result is None:
-            raise RuntimeError("git fetch ended without a result")
-        stdout, stderr, rc = fetch_result
-        if rc == 0:
-            _, reset_stderr, reset_rc = await _run_git(
+        # Check if directory has working files or if .git is corrupted
+        non_git_files = sum(1 for p in repo_path.iterdir() if p.name != ".git")
+        if non_git_files == 0:
+            logger.info("Found .git without working tree files. Removing for fresh clone.")
+            shutil.rmtree(repo_path, ignore_errors=True)
+        else:
+            yield "Updating existing clone..."
+            fetch_result = None
+            async for item in _run_git_with_heartbeats(
                 "git",
-                "reset",
-                "--hard",
-                "FETCH_HEAD",
+                "fetch",
+                "--depth=1",
                 "--quiet",
                 cwd=str(repo_path),
-            )
-            if reset_rc != 0:
-                raise RuntimeError(f"git reset failed: {reset_stderr}")
-        else:
-            logger.warning(f"git fetch failed for {repo_url}: {stderr or stdout}")
-            # A timeout or failed update may leave stale lock files. Remove the
-            # clone and retry once from scratch instead of hanging every retry.
-            logger.warning("Removing the failed existing clone for a fresh clone")
-            shutil.rmtree(repo_path, ignore_errors=True)
+                timeout=config.GIT_COMMAND_TIMEOUT,
+                status="Still updating the existing clone",
+            ):
+                if isinstance(item, tuple):
+                    fetch_result = item
+                else:
+                    yield item
+
+            if fetch_result is None:
+                raise RuntimeError("git fetch ended without a result")
+            stdout, stderr, rc = fetch_result
+            if rc == 0:
+                _, reset_stderr, reset_rc = await _run_git(
+                    "git",
+                    "reset",
+                    "--hard",
+                    "FETCH_HEAD",
+                    "--quiet",
+                    cwd=str(repo_path),
+                )
+                if reset_rc != 0:
+                    logger.warning(f"git reset failed: {reset_stderr}. Removing for fresh clone.")
+                    shutil.rmtree(repo_path, ignore_errors=True)
+            else:
+                logger.warning(f"git fetch failed for {repo_url}: {stderr or stdout}. Removing for fresh clone.")
+                shutil.rmtree(repo_path, ignore_errors=True)
 
     if not (repo_path / ".git").exists():
         if repo_path.exists():

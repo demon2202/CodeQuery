@@ -1,5 +1,6 @@
 /**
  * MessageContent — renders assistant message content with:
+ * - Interactive Options / Grill-Me blocks (```options with JSON)
  * - Chart.js charts (```chart blocks with JSON)
  * - Mermaid diagrams (```mermaid blocks)
  * - Code blocks with language labels and copy button
@@ -11,13 +12,21 @@ import React, { useMemo, lazy, Suspense } from 'react';
 
 const MermaidDiagram = lazy(() => import('./MermaidDiagram'));
 const ChartComponent = lazy(() => import('./ChartComponent'));
+const InteractiveOptions = lazy(() => import('./InteractiveOptions'));
 
-export default function MessageContent({ content }) {
+export default function MessageContent({ content, onSelectOption }) {
   const parts = useMemo(() => parseContent(content), [content]);
 
   return (
     <>
       {parts.map((part, i) => {
+        if (part.type === 'options') {
+          return (
+            <Suspense key={i} fallback={<div className="options-loading">Loading options…</div>}>
+              <InteractiveOptions spec={part.spec} onSelect={onSelectOption} />
+            </Suspense>
+          );
+        }
         if (part.type === 'chart') {
           return (
             <Suspense key={i} fallback={<div className="chart-loading">Loading chart…</div>}>
@@ -69,8 +78,14 @@ function parseContent(text) {
     const lang = match[1].toLowerCase();
     const code = match[2].trim();
 
-    if (lang === 'chart') {
-      // Try multiple JSON parsing strategies
+    if (lang === 'options' || lang === 'interactive') {
+      const spec = tryParseOptionsJSON(code);
+      if (spec) {
+        parts.push({ type: 'options', spec });
+      } else {
+        parts.push({ type: 'code', lang: 'options', code });
+      }
+    } else if (lang === 'chart') {
       const spec = tryParseChartJSON(code);
       if (spec) {
         parts.push({ type: 'chart', spec });
@@ -94,35 +109,52 @@ function parseContent(text) {
 }
 
 
+function tryParseOptionsJSON(code) {
+  try {
+    const spec = JSON.parse(code);
+    if (spec.options && Array.isArray(spec.options)) return spec;
+  } catch {}
+
+  try {
+    const cleaned = code.replace(/,\s*([}\]])/g, '$1').replace(/'/g, '"');
+    const spec = JSON.parse(cleaned);
+    if (spec.options && Array.isArray(spec.options)) return spec;
+  } catch {}
+
+  try {
+    const match = code.match(/\{[\s\S]*"options"\s*:[\s\S]*\}/);
+    if (match) {
+      const cleaned = match[0].replace(/,\s*([}\]])/g, '$1');
+      const spec = JSON.parse(cleaned);
+      if (spec.options && Array.isArray(spec.options)) return spec;
+    }
+  } catch {}
+
+  return null;
+}
+
+
 /**
- * Try to parse chart JSON — handles common LLM mistakes:
- * 1. Valid JSON (ideal)
- * 2. JSON with trailing commas
- * 3. JSON with single quotes
- * 4. YAML-ish format (attempt to reconstruct)
+ * Try to parse chart JSON — handles common LLM mistakes
  */
 function tryParseChartJSON(code) {
-  // Strategy 1: Direct JSON parse
   try {
     const spec = JSON.parse(code);
     if (spec.type && spec.labels && spec.datasets) return spec;
   } catch {}
 
-  // Strategy 2: Remove trailing commas and try again
   try {
     const cleaned = code.replace(/,\s*([}\]])/g, '$1');
     const spec = JSON.parse(cleaned);
     if (spec.type && spec.labels && spec.datasets) return spec;
   } catch {}
 
-  // Strategy 3: Replace single quotes with double quotes
   try {
     const cleaned = code.replace(/'/g, '"').replace(/,\s*([}\]])/g, '$1');
     const spec = JSON.parse(cleaned);
     if (spec.type && spec.labels && spec.datasets) return spec;
   } catch {}
 
-  // Strategy 4: Try to find a JSON object anywhere in the text
   try {
     const jsonMatch = code.match(/\{[\s\S]*"type"\s*:[\s\S]*\}/);
     if (jsonMatch) {
@@ -152,10 +184,8 @@ function renderInline(text) {
     }
 
     if (match[2]) {
-      // Bold — check if it looks like a file:line citation
       const boldText = match[2];
       if (/^[\w./\\:-]+$/.test(boldText) && boldText.includes(':')) {
-        // File:line citation — render with special styling
         segments.push(<strong key={match.index} className="msg-bold msg-cite">{boldText}</strong>);
       } else {
         segments.push(<strong key={match.index} className="msg-bold">{boldText}</strong>);
@@ -163,10 +193,8 @@ function renderInline(text) {
     } else if (match[3]) {
       segments.push(<code key={match.index} className="msg-inline-code">{match[3]}</code>);
     } else if (match[4]) {
-      // Heading
       segments.push(<div key={match.index} className="msg-heading">{match[4]}</div>);
     } else if (match[5]) {
-      // Bullet point
       segments.push(<div key={match.index} className="msg-bullet">• {match[5]}</div>);
     }
 
