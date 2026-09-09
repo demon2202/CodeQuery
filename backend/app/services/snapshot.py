@@ -110,22 +110,15 @@ def create_snapshot(
 
     logger.info(f"Snapshot created: {snap_dir} ({len(file_lang_pairs)} files)")
 
-    # 4. Delete the cloned repo directory — the snapshot replaces it
-    # On Windows, files may be locked so we try multiple times
-    deleted = False
-    for attempt in range(3):
-        try:
-            shutil.rmtree(repo_path)
-            deleted = True
-            logger.info(f"Deleted repo clone: {repo_path}")
-            break
-        except Exception as e:
-            if attempt < 2:
-                import time as _t
-                _t.sleep(0.5)
-            else:
-                logger.warning(f"Failed to delete repo clone after 3 attempts: {e}")
-                logger.warning("Repo files will remain on disk. You can manually delete them later.")
+    # 4. Delete the cloned repo directory — the snapshot replaces it.
+    # force_remove survives Windows read-only packfiles / locked files that
+    # plain rmtree(ignore_errors=True) silently leaves behind.
+    from .cloner import force_remove
+
+    if force_remove(repo_path):
+        logger.info(f"Deleted repo clone: {repo_path}")
+    else:
+        logger.warning("Failed to fully delete repo clone; leftovers may remain on disk.")
 
 
 # ── Read operations ──────────────────────────────────────────────────
@@ -229,7 +222,39 @@ def get_dir_names(repo_url: str) -> set[str]:
 
 def delete_snapshot(repo_url: str) -> None:
     """Delete a repo's snapshot."""
+    from .cloner import force_remove
+
     snap_dir = _snapshot_dir(repo_url)
     if snap_dir.exists():
-        shutil.rmtree(snap_dir, ignore_errors=True)
+        force_remove(snap_dir)
         logger.info(f"Deleted snapshot: {snap_dir}")
+
+
+# ── Dependency graph persistence ─────────────────────────────────────
+
+
+def save_graph(repo_url: str, graph: dict) -> None:
+    """Persist the index-time dependency graph next to the snapshot."""
+    snap_dir = _snapshot_dir(repo_url)
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(snap_dir / "graph.json", "w") as f:
+            json.dump(graph, f)
+        logger.info(
+            f"Dependency graph saved: {graph.get('num_edges', 0)} edges, "
+            f"{graph.get('num_files', 0)} files"
+        )
+    except OSError as e:
+        logger.warning(f"Failed to save dependency graph: {e}")
+
+
+def get_graph(repo_url: str) -> Optional[dict]:
+    """Load the persisted dependency graph, or None if missing/stale."""
+    graph_path = _snapshot_dir(repo_url) / "graph.json"
+    if not graph_path.exists():
+        return None
+    try:
+        with open(graph_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None

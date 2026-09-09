@@ -8,7 +8,7 @@ services:
       python -c "
       from fastembed import TextEmbedding;
       cache = '/opt/render/project/src/.fastembed_cache';
-      print('Downloading all-MiniLM-L6-v2 ONNX model...');
+      print('Downloading all-MiniLM-L6-v2 ONNX model (fallback embeddings)...');
       TextEmbedding(
           model_name='sentence-transformers/all-MiniLM-L6-v2',
           cache_dir=cache,
@@ -19,8 +19,10 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
 
     envVars:
-      # Cache fastembed ONNX models between build and runtime
-      # (fastembed uses onnxruntime — already installed by chromadb — so no torch needed)
+      # Cache fastembed ONNX models between build and runtime.
+      # (FastEmbed is now only the FALLBACK embedder — Gemini is primary,
+      # but keep the model warm so a missing/rate-limited key degrades
+      # gracefully instead of failing.)
       - key: FASTEMBED_CACHE_DIR
         value: /opt/render/project/src/.fastembed_cache
 
@@ -28,25 +30,33 @@ services:
       - key: CQ_LLM_PROVIDER
         value: groq
       - key: CQ_GROQ_MODEL
-        value: openai/gpt-oss-20b  # Free on Groq free tier (llama-3.3-70b-versatile is retired/Enterprise-only)
+        value: openai/gpt-oss-20b  # free tier (llama-3.3-70b-versatile retired Aug 2026)
       - key: CQ_RETRIEVAL_TOP_K
-        value: "4"  # Trimmed from 12 to stay under free tier's 8K TPM
+        value: "4"   # regular questions — stays under free tier's 8K TPM
+      - key: CQ_SLASH_TOP_K
+        value: "8"   # slash commands get a wider window
       - key: CQ_MAX_CHUNK_CHARS
-        value: "1500"  # 4 chunks x 1500 chars ~1.5K tokens per prompt
+        value: "1500"  # 8 chunks x 1500 chars ~3K tokens max per prompt
       - key: GROQ_API_KEY
         sync: false  # Set this manually in the Render dashboard — never commit API keys
 
-      # Embeddings — sentence-transformers, NOT Ollama (Ollama unavailable on Render)
+      # Embeddings — Gemini free API: 0 local RAM, ~100 texts per network call.
+      # This is what makes indexing fast on the Render free tier.
+      # Get a free key at aistudio.google.com (no card required).
       - key: CQ_EMBEDDING_PROVIDER
-        value: sentence-transformers
-      - key: CQ_EMBEDDING_MODEL
-        value: sentence-transformers/all-MiniLM-L6-v2  # Small ONNX model; do not use Jina on 512 MB.
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false  # Set this manually in the Render dashboard — never commit API keys
+      - key: CQ_GEMINI_EMBED_MODEL
+        value: text-embedding-004
 
-      # Keep both the outer indexer batch and FastEmbed's internal batch small.
+      # Index flush batch — with Gemini, one flush = one batched network call
       - key: CQ_EMBEDDING_BATCH_SIZE
-        value: "8"
-      - key: CQ_FASTEMBED_THREADS
-        value: "1"
+        value: "64"
+      # Parallel tree-sitter parsing during indexing (RAM-safe: one file's
+      # text in flight per worker — no embedding models in these threads)
+      - key: CQ_PARSE_WORKERS
+        value: "4"
       - key: CQ_RERANK_ENABLED
         value: "false"
 
@@ -80,6 +90,3 @@ services:
         value: "false"
       - key: CQ_AUTO_CLEANUP_ON_RESET
         value: "true"
-
-
-

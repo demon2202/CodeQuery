@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import time
 import logging
 import os
 import re
@@ -31,6 +32,38 @@ def _get_git_exe() -> str:
 _SAFE_URL_RE = re.compile(
     r"^https?://(www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$"
 )
+
+
+def force_remove(path: Path, attempts: int = 5) -> bool:
+    """Recursively delete a path, surviving read-only/locked files.
+
+    Plain shutil.rmtree(ignore_errors=True) silently leaves half-deleted git
+    checkouts behind (Windows file locks, read-only packfiles). The next clone
+    then AJAX fetches into a skeleton directory with a handful of dotfiles
+    and indexing fails with "Repo has N files but none match". This helper
+    chmods undeletable entries and retries; returns True if the path is gone.
+    """
+    def _onerror(func, p, _exc):
+        try:
+            os.chmod(p, 0o700 if os.path.isdir(p) else 0o600)
+            func(p)
+        except Exception:
+            pass
+
+    for _ in range(attempts):
+        if not path.exists():
+            return True
+        try:
+            shutil.rmtree(path, onerror=_onerror)
+        except Exception:
+            pass
+        time.sleep(0.3)
+    if path.exists():
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+    return not path.exists()
 
 
 def validate_repo_url(url: str) -> str:
@@ -216,7 +249,7 @@ async def clone_repo_streaming(repo_url: str):
         non_git_files = sum(1 for p in repo_path.iterdir() if p.name != ".git")
         if non_git_files == 0:
             logger.info("Found .git without working tree files. Removing for fresh clone.")
-            shutil.rmtree(repo_path, ignore_errors=True)
+            force_remove(repo_path)
         else:
             yield "Updating existing clone..."
             fetch_result = None
@@ -248,14 +281,14 @@ async def clone_repo_streaming(repo_url: str):
                 )
                 if reset_rc != 0:
                     logger.warning(f"git reset failed: {reset_stderr}. Removing for fresh clone.")
-                    shutil.rmtree(repo_path, ignore_errors=True)
+                    force_remove(repo_path)
             else:
                 logger.warning(f"git fetch failed for {repo_url}: {stderr or stdout}. Removing for fresh clone.")
-                shutil.rmtree(repo_path, ignore_errors=True)
+            force_remove(repo_path)
 
     if not (repo_path / ".git").exists():
         if repo_path.exists():
-            shutil.rmtree(repo_path, ignore_errors=True)
+            force_remove(repo_path)
 
         yield "Cloning repository (may take 30-60s for large repos)..."
 
@@ -281,7 +314,7 @@ async def clone_repo_streaming(repo_url: str):
         stdout, stderr, rc = clone_result
 
         if rc != 0:
-            shutil.rmtree(repo_path, ignore_errors=True)
+            force_remove(repo_path)
             parts = ["git clone failed"]
             if stderr:
                 parts.append(stderr)
@@ -313,13 +346,13 @@ async def clone_repo_streaming(repo_url: str):
     has_files = any(True for _ in repo_path.rglob("*") if _.is_file() and not _.name.startswith("."))
     if not has_files:
         logger.error(f"Cloned repo appears empty: {repo_path}")
-        shutil.rmtree(repo_path, ignore_errors=True)
+        force_remove(repo_path)
         raise RuntimeError("Git clone succeeded but the repo directory is empty.")
 
     size_mb = _dir_size_mb(repo_path)
     if size_mb > config.MAX_REPO_SIZE_MB:
         logger.warning(f"Repo {repo_url} is {size_mb:.0f}MB, exceeds limit of {config.MAX_REPO_SIZE_MB}MB")
-        shutil.rmtree(repo_path, ignore_errors=True)
+        force_remove(repo_path)
         raise RuntimeError(
             f"Repository is too large ({size_mb:.0f}MB, even shallow-cloned). "
             f"This deployment supports repos up to {config.MAX_REPO_SIZE_MB}MB."

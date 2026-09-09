@@ -217,8 +217,9 @@ _cache: dict[str, tuple] = {}
 
 
 def search_cached(repo_url: str, question: str, n_results: int = config.RETRIEVAL_TOP_K):
-    """Search with trivial exact-match cache."""
-    key = f"{repo_url}:{question}"
+    """Search with trivial exact-match cache. n_results is part of the key —
+    slash commands fetch a wider window than regular questions."""
+    key = f"{repo_url}:{n_results}:{question}"
     if key in _cache:
         return _cache[key]
     result = search(repo_url, question, n_results)

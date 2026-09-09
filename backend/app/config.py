@@ -39,6 +39,8 @@ OLLAMA_EMBED_MODEL = os.getenv("CQ_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 # Gemini Embeddings (Free tier on Google AI Studio — 0 RAM usage on Render)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_EMBED_MODEL = os.getenv("CQ_GEMINI_EMBED_MODEL", "text-embedding-004")
+# Texts per batchEmbedContents call (API max is 100)
+GEMINI_BATCH_SIZE = int(os.getenv("CQ_GEMINI_BATCH_SIZE", "100"))
 
 # fastembed model — requires full HuggingFace-style name (fastembed >= 0.4)
 # CQ_EMBEDDING_MODEL=jinaai/jina-embeddings-v2-base-code for better code retrieval
@@ -59,6 +61,16 @@ SLIDING_WINDOW_OVERLAP = int(os.getenv("CQ_SLIDING_WINDOW_OVERLAP", "10"))
 
 # Retrieval
 RETRIEVAL_TOP_K = int(os.getenv("CQ_RETRIEVAL_TOP_K", "12"))
+# Slash commands (/grill-me, /architecture, ...) get a wider context window
+# than regular questions — they synthesize across more of the repo.
+SLASH_COMMAND_TOP_K = int(os.getenv("CQ_SLASH_TOP_K", "8"))
+
+# Dependency graph (built at index time from actual import statements)
+GRAPH_MAX_EDGES = int(os.getenv("CQ_GRAPH_MAX_EDGES", "80"))
+
+# Parallel tree-sitter parsing during indexing (RAM-safe: parsing holds no
+# embedding models, only transient file contents)
+PARSE_WORKERS = int(os.getenv("CQ_PARSE_WORKERS", "4"))
 
 # Min similarity score — auto-adjusts by model, override with CQ_RETRIEVAL_MIN_SCORE
 _provider_explicitly_set = os.getenv("CQ_EMBEDDING_PROVIDER") is not None

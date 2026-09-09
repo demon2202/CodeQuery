@@ -208,6 +208,26 @@ async def delete_repo_index(repo_url: str = Query(...), delete_files: bool = Que
     return {"status": "deleted", "files_removed": delete_files}
 
 
+@router.get("/graph")
+async def get_dependency_graph(repo_url: str = Query(...)):
+    """Return the index-time dependency graph (real import edges) as exact Mermaid."""
+    from ..services.snapshot import get_graph
+    from ..services.graph_builder import graph_to_mermaid
+
+    graph = get_graph(repo_url)
+    if not graph or not graph.get("edges"):
+        raise HTTPException(
+            status_code=404,
+            detail="Dependency graph not available for this repo — re-index it to build one.",
+        )
+    return {
+        "num_files": graph.get("num_files", 0),
+        "num_edges": graph.get("num_edges", 0),
+        "hub_files": graph.get("hub_files", [])[:10],
+        "mermaid": graph_to_mermaid(graph.get("edges", []), max_edges=config.GRAPH_MAX_EDGES),
+    }
+
+
 @router.get("/tree")
 async def get_file_tree(repo_url: str = Query(...)):
     """Get the file tree for a repo."""

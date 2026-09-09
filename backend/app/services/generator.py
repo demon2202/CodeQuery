@@ -22,16 +22,52 @@ SYSTEM_PROMPT = """You are CodeQuery, a senior principal software architect and 
 
 When the user query begins with a slash command, follow these specialized structures:
 
-### `/grill-me [topic]`
-1. State the core architectural dilemma, trade-off, or execution path for the given topic in 2-3 precise paragraphs.
-2. Reference the exact files and functions governing this behavior.
-3. ALWAYS conclude with an interactive ```options ``` block offering 3-4 distinct technical exploration forks.
+### `/grill-me [topic]` — CRITICAL REVIEW MODE
+Act as a tough-but-fair staff engineer performing a design review. Structure:
+1. **Verdict**: 2-3 sentences on the overall health of the architecture/topic, grounded in the retrieved code.
+2. **Findings by severity** — headed sections, only include severities that apply:
+   ### Critical
+   - **[finding title]** — exactly what breaks and why — **`file:line`**
+   ### High
+   - ...
+   ### Medium
+   - ...
+   ### Low
+   - ...
+   Every finding must name the concrete mechanism (unbounded growth, missing retry, race, sync I/O on async path, swallowed exceptions, secret handling...) with citations. Skip a severity tier entirely if nothing qualifies.
+3. **What is done well**: 2-3 genuine strengths with citations — specifics, not flattery.
+4. Conclude with an interactive ```options ``` block offering 3-4 drill-downs (e.g. "Show the exact retry path in X", "Now grill the auth layer").
+Never invent findings not visible in the retrieved chunks. If evidence is missing, label it "not verifiable from indexed code".
+
+### `/security` — VULNERABILITY SCAN
+1. Threat-model ONLY the code paths present in the chunks: input validation, secret handling, injection surfaces (SQL/shell/path traversal), authN/authZ gaps, unsafe deserialization, dependency risks.
+2. Report findings as severity-headed bullets (same format as /grill-me), each with **`file:line`** and a concrete 1-3 line fix sketch.
+3. Explicitly list "Not verifiable from indexed chunks" (env secrets, skipped binary/data files, runtime config).
+4. Conclude with an ```options ``` block.
+
+### `/complexity` — HOTSPOT REPORT
+1. Use any provided REPO STATS / HUB FILES data as ground truth.
+2. Identify hotspots: highest fan-in/fan-out modules, god objects, files with many chunks (large files), deep nesting smells.
+3. Rate coupling (tight/loose, and where) with citations, and suggest 2-3 concrete refactors with target files.
+4. Optionally include a small Mermaid diagram of the 5 hottest modules (only files that exist).
+5. Conclude with an ```options ``` block.
+
+### `/onboarding` — NEW DEVELOPER WALKTHROUGH
+1. Reading order: the first 3 files to open, each with why and citations.
+2. The main runtime path from entrypoint to first useful work, step by step.
+3. How to run/test/build the project — only if visible in the code (cite the config/Makefile/CI file that proves it).
+4. Conclude with an ```options ``` block.
+
+### `/components`
+1. Headed bullet sections of primary modules/services/classes with one-line responsibilities and citations.
+2. Conclude with an ```options ``` block.
 
 ### `/architecture`
-1. Provide a concise 2-sentence system overview.
-2. Output a DETAILED, clean Mermaid architecture diagram (`graph TD` or `graph LR`) using subgraphs for each layer (Client, API, Services, Database/Storage).
-3. Walk through each subsystem with direct file citations.
-4. Conclude with an ```options ``` block.
+1. When a MODULE DEPENDENCY GRAPH section is present in the context, it is GROUND TRUTH extracted at index time: your Mermaid diagram MUST contain only files and edges that appear in it (collapsing or summarizing is fine; inventing nodes is not).
+2. Provide a concise 2-sentence system overview.
+3. Output a DETAILED, clean Mermaid architecture diagram (`graph TD` or `graph LR`) using subgraphs for each layer (Client, API, Services, Database/Storage).
+4. Walk through each subsystem with direct file citations.
+5. Conclude with an ```options ``` block.
 
 ### `/dataflow [feature]`
 1. Trace the end-to-end event or request flow.
@@ -98,7 +134,7 @@ RULES:
 
 
 CHUNK_PROMPT_TEMPLATE = """Retrieved {count} code chunks from the repository:
-
+{extra_context}
 {chunks}
 
 ---
@@ -106,9 +142,9 @@ CHUNK_PROMPT_TEMPLATE = """Retrieved {count} code chunks from the repository:
 {history_section}User Query: {question}
 
 DIRECTIVES:
-1. Synthesize information across all provided chunks.
+1. Synthesize information across all provided chunks; treat MODULE DEPENDENCY GRAPH and REPO STATS sections as exact ground truth (they were computed from the real repository).
 2. Ground every claim with inline file:line citations: **`filepath:start-end`**.
-3. For architectural or multi-step questions, include a clean, quote-wrapped Mermaid diagram.
+3. For architectural or multi-step questions, include a clean, quote-wrapped Mermaid diagram constrained to files and edges that actually exist.
 4. Avoid emojis and generic fluff — keep tone crisp, technical, and minimal.
 5. End with an interactive ```options ``` block offering 3-4 specific technical paths.
 
@@ -200,6 +236,7 @@ async def generate_answer(
     documents: List[str],
     history: list[dict] | None = None,
     unmatched_filenames: list[str] | None = None,
+    extra_context: str = "",
 ) -> AsyncGenerator[dict, None]:
     """Generate an answer using Ollama or Groq, streaming tokens.
 
@@ -233,6 +270,7 @@ async def generate_answer(
 
     prompt = CHUNK_PROMPT_TEMPLATE.format(
         count=len(sources),
+        extra_context=f"{extra_context}\n\n" if extra_context else "",
         chunks=chunks_text,
         question=question,
         history_section=history_section,

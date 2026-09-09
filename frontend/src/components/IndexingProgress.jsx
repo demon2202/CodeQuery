@@ -44,6 +44,7 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
   const [stage, setStage] = useState('cloning');
   const [current, setCurrent] = useState(0);
   const [total, setTotal] = useState(0);
+  const [rate, setRate] = useState(0);
   const [message, setMessage] = useState('Connecting to the backend…');
   const [cloneDetail, setCloneDetail] = useState('');
   const [log, setLog] = useState([]);
@@ -116,6 +117,9 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
             if (event.current !== undefined) {
               setCurrent(event.current);
               setTotal(event.total || 0);
+            }
+            if (event.chunks_per_sec !== undefined) {
+              setRate(event.chunks_per_sec);
             }
           }
           if (event.message) {
@@ -191,6 +195,9 @@ export default function IndexingProgress({ repoUrl, onProgress, onCancel }) {
               <div className="progress-fill" style={{ width: `${pct}%` }}></div>
             </div>
             <span className="progress-num">{current}/{total}</span>
+            {stage === 'parsing' && rate > 0 && (
+              <span className="progress-rate">{rate} chunks/sec</span>
+            )}
           </div>
         )}
 

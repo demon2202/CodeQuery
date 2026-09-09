@@ -11,7 +11,8 @@ from ..models import ChatRequest, HealthResponse
 from ..services.search import search_cached, search
 from ..services.generator import generate_answer, check_ollama_health
 from ..services.cloner import check_git_available, get_repo_path
-from ..services.snapshot import get_dir_names, get_all_file_paths
+from ..services.snapshot import get_dir_names, get_all_file_paths, get_graph, get_repo_stats
+from ..services.graph_builder import graph_context_text
 from ..services import query_rewrite
 from ..store.chroma_store import get_store
 
@@ -167,10 +168,43 @@ async def chat(request: ChatRequest):
             else:
                 search_query = query_rewrite.contextual_query(request.question, request.history)
 
+            # Slash commands synthesize across more of the repo than regular
+            # questions, so they get a wider retrieval window.
+            slash_cmd = ""
+            stripped = request.question.strip()
+            if stripped.startswith("/"):
+                slash_cmd = stripped.split(maxsplit=1)[0].lower()
+            top_k = config.SLASH_COMMAND_TOP_K if slash_cmd else config.RETRIEVAL_TOP_K
+
             sources, documents, _, unmatched_filenames = search_cached(
                 repo_url=request.repo_url,
                 question=search_query,
+                n_results=top_k,
             )
+
+            # For architecture-type commands, inject the exact index-time
+            # dependency graph + repo stats so diagrams are grounded in the
+            # real import structure instead of the model's guess.
+            extra_context = ""
+            if slash_cmd in ("/architecture", "/dataflow", "/summary", "/complexity", "/components"):
+                try:
+                    ctx_parts = []
+                    graph = get_graph(request.repo_url)
+                    if graph and graph.get("edges"):
+                        ctx_parts.append(graph_context_text(graph, max_edges=min(config.GRAPH_MAX_EDGES, 40)))
+                    stats = get_repo_stats(request.repo_url)
+                    if stats and slash_cmd in ("/complexity", "/summary", "/components"):
+                        langs = ", ".join(
+                            f"{l['name']} {l['pct']}%" for l in stats.get("languages", [])[:6]
+                        )
+                        ctx_parts.append(
+                            "REPO STATS (exact): "
+                            f"files={stats.get('files')}, chunks={stats.get('chunks')}, "
+                            f"functions={stats.get('functions')}, languages: {langs}"
+                        )
+                    extra_context = "\n\n".join(ctx_parts)
+                except Exception as e:
+                    logger.debug(f"Graph/stats context unavailable (non-critical): {e}")
 
             if not sources:
                 if unmatched_filenames:
@@ -191,6 +225,7 @@ async def chat(request: ChatRequest):
                 documents=documents,
                 history=request.history,
                 unmatched_filenames=unmatched_filenames,
+                extra_context=extra_context,
             ):
                 yield f"data: {json.dumps(event)}\n\n"
 

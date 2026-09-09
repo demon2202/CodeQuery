@@ -71,7 +71,7 @@ def _sanitize_for_embed(text: str) -> str:
 # Gemini Free Embeddings (Cloud-based, 0 local RAM)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _gemini_embed_single(text: str) -> List[float]:
+def _gemini_embed_single(text: str, task_type: str = "") -> List[float]:
     if not config.GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set in environment.")
     text = _sanitize_for_embed(text)
@@ -81,6 +81,10 @@ def _gemini_embed_single(text: str) -> List[float]:
         "model": f"models/{model}",
         "content": {"parts": [{"text": text}]},
     }
+    # RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY noticeably improves relevance vs.
+    # untyped embeddings — it is the same free API call, just configured right.
+    if task_type:
+        payload["taskType"] = task_type
     with httpx.Client(timeout=30.0) as client:
         resp = client.post(url, json=payload)
         if resp.status_code != 200:
@@ -89,7 +93,7 @@ def _gemini_embed_single(text: str) -> List[float]:
         return data["embedding"]["values"]
 
 
-def _gemini_embed_batch(texts: List[str]) -> List[List[float]]:
+def _gemini_embed_batch(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List[List[float]]:
     if not config.GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set in environment.")
     _load_cache()
@@ -115,20 +119,33 @@ def _gemini_embed_batch(texts: List[str]) -> List[List[float]]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents?key={config.GEMINI_API_KEY}"
 
     uncached_embeddings = []
-    batch_size = 20  # Gemini batch limit
+    batch_size = max(1, min(100, config.GEMINI_BATCH_SIZE))  # Gemini API limit is 100
     batch_start = 0
 
     with httpx.Client(timeout=60.0) as client:
         while batch_start < len(uncached_texts):
             batch = uncached_texts[batch_start:batch_start + batch_size]
             requests = [
-                {"model": f"models/{model}", "content": {"parts": [{"text": t}]}}
+                {"model": f"models/{model}", "content": {"parts": [{"text": t}]}, "taskType": task_type}
                 for t in batch
             ]
             try:
-                resp = client.post(url, json={"requests": requests})
-                if resp.status_code != 200:
-                    raise RuntimeError(f"Gemini batch embed error {resp.status_code}: {resp.text[:300]}")
+                resp = None
+                last_status = 0
+                # Free tier rate limits surface as 429 — back off instead of
+                # immediately falling into the slow sequential path.
+                for attempt in range(4):
+                    resp = client.post(url, json={"requests": requests})
+                    last_status = resp.status_code
+                    if last_status == 200:
+                        break
+                    if last_status in (429, 500, 502, 503) and attempt < 3:
+                        import time as _time
+                        _time.sleep(2 * (attempt + 1))
+                        continue
+                    raise RuntimeError(
+                        f"Gemini batch embed error {last_status}: {resp.text[:300]}"
+                    )
                 data = resp.json()
                 for item in data.get("embeddings", []):
                     uncached_embeddings.append(item["values"])
@@ -137,7 +154,7 @@ def _gemini_embed_batch(texts: List[str]) -> List[List[float]]:
                 logger.warning(f"Gemini batch embed error: {e}. Retrying sequentially...")
                 for item_text in batch:
                     try:
-                        single_val = _gemini_embed_single(item_text)
+                        single_val = _gemini_embed_single(item_text, task_type=task_type)
                         uncached_embeddings.append(single_val)
                     except Exception as single_err:
                         logger.error(f"Sequential Gemini embed failed: {single_err}")
@@ -407,7 +424,7 @@ def encode_batch(texts: List[str]) -> List[List[float]]:
         return []
     provider = _get_provider()
     if provider == "gemini":
-        return _gemini_embed_batch(texts)
+        return _gemini_embed_batch(texts, task_type="RETRIEVAL_DOCUMENT")
     elif provider == "ollama":
         return _ollama_embed_batch(texts)
     return _st_encode_batch(texts)
@@ -416,7 +433,7 @@ def encode_batch(texts: List[str]) -> List[List[float]]:
 def encode_single(text: str) -> List[float]:
     provider = _get_provider()
     if provider == "gemini":
-        return _gemini_embed_single(text)
+        return _gemini_embed_single(text, task_type="RETRIEVAL_QUERY")
     elif provider == "ollama":
         return _ollama_embed_single(text)
     return _st_encode_single(text)

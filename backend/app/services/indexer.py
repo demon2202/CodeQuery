@@ -4,6 +4,7 @@ Refactored for ultra-low memory (<250MB) and keep-alive SSE heartbeats.
 """
 
 import asyncio
+import concurrent.futures
 import gc
 import logging
 import time
@@ -12,16 +13,17 @@ from typing import AsyncGenerator
 
 from .. import config
 from ..store.chroma_store import get_store
-from .cloner import clone_repo_streaming, get_repo_path, get_changed_files
+from .cloner import clone_repo_streaming, get_repo_path, get_changed_files, force_remove
 from .walker import walk_source_files
 from .chunker import chunk_file, CodeChunk
 from .embedder import encode_batch
+from .graph_builder import extract_imports, build_dependency_graph, GRAPH_LANGS
 
 try:
     from .embedder import flush_cache as _flush_embed_cache
 except ImportError:
     _flush_embed_cache = None
-from .snapshot import create_snapshot
+from .snapshot import create_snapshot, get_graph as get_saved_graph, save_graph
 
 logger = logging.getLogger(__name__)
 
@@ -78,60 +80,88 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
     store = get_store()
     loop = asyncio.get_event_loop()
 
-    # 1. Clone with heartbeats
-    yield {"type": "progress", "stage": "cloning", "message": f"Cloning {repo_url}..."}
+    # Clone → walk, with ONE automatic recovery if a previous deletion left a
+    # corrupt/partial checkout behind (the classic "Repo has 3 files" bug on
+    # Windows: read-only git files survive rmtree, the fetch path then works
+    # on a skeleton directory).
     repo_path = None
     commit_hash = None
-    try:
-        async for item in clone_repo_streaming(repo_url):
-            if isinstance(item, tuple):
-                repo_path, commit_hash = item
-            else:
-                yield {"type": "progress", "stage": "cloning", "message": item}
-    except Exception as e:
-        yield {"type": "error", "message": f"Clone failed: {e}"}
-        return
-
-    yield {"type": "progress", "stage": "cloning", "message": f"Cloned (commit {commit_hash[:8] if commit_hash else 'HEAD'})"}
-
-    # 2. Check for incremental update
-    old_hash = store.get_commit_hash(repo_url)
     changed_files = None
+    file_lang_pairs: list = []
+    total_all_files = 0
 
-    if old_hash and old_hash != commit_hash:
-        changed_files = await get_changed_files(repo_path, old_hash, commit_hash)
-        if changed_files:
-            yield {
-                "type": "progress",
-                "stage": "incremental",
-                "message": f"{len(changed_files)} changed files (incremental)",
-            }
-            for f in changed_files:
-                try:
-                    store.delete_chunks_by_file(repo_url, f)
-                except Exception:
-                    pass
-        else:
-            logger.info("Incremental diff failed — doing full re-index")
-            changed_files = None
-    elif old_hash == commit_hash:
-        yield {"type": "progress", "stage": "incremental", "message": "Already up to date (same commit)"}
+    for attempt in range(2):
+        # 1. Clone with heartbeats
+        yield {"type": "progress", "stage": "cloning", "message": f"Cloning {repo_url}..."}
+        try:
+            async for item in clone_repo_streaming(repo_url):
+                if isinstance(item, tuple):
+                    repo_path, commit_hash = item
+                else:
+                    yield {"type": "progress", "stage": "cloning", "message": item}
+        except Exception as e:
+            if attempt == 0 and repo_path is not None:
+                logger.warning(f"Clone attempt 1 failed ({e}); wiping and retrying once")
+                yield {"type": "progress", "stage": "cloning", "message": "Clone hiccup — wiping and retrying once..."}
+                force_remove(repo_path)
+                continue
+            yield {"type": "error", "message": f"Clone failed: {e}"}
+            return
 
-    # 3. Walk files
-    yield {"type": "progress", "stage": "walking", "message": "Scanning files..."}
+        yield {"type": "progress", "stage": "cloning", "message": f"Cloned (commit {commit_hash[:8] if commit_hash else 'HEAD'})"}
 
-    if not repo_path.exists():
-        yield {"type": "error", "message": f"Repo directory not found: {repo_path}"}
-        return
+        # 2. Check for incremental update
+        old_hash = store.get_commit_hash(repo_url)
+        changed_files = None
 
-    total_all_files = sum(1 for _ in repo_path.rglob("*") if _.is_file())
-    if total_all_files == 0:
-        yield {"type": "error", "message": f"Repo directory is empty: {repo_path}"}
-        return
+        if old_hash and old_hash != commit_hash:
+            changed_files = await get_changed_files(repo_path, old_hash, commit_hash)
+            if changed_files:
+                yield {
+                    "type": "progress",
+                    "stage": "incremental",
+                    "message": f"{len(changed_files)} changed files (incremental)",
+                }
+                for f in changed_files:
+                    try:
+                        store.delete_chunks_by_file(repo_url, f)
+                    except Exception:
+                        pass
+            else:
+                logger.info("Incremental diff failed — doing full re-index")
+                changed_files = None
+        elif old_hash == commit_hash:
+            yield {"type": "progress", "stage": "incremental", "message": "Already up to date (same commit)"}
 
-    file_lang_pairs = walk_source_files(repo_path, changed_files)
-    total_files = len(file_lang_pairs)
-    if total_files == 0:
+        # 3. Walk files
+        yield {"type": "progress", "stage": "walking", "message": "Scanning files..."}
+
+        if not repo_path.exists():
+            yield {"type": "error", "message": f"Repo directory not found: {repo_path}"}
+            return
+
+        total_all_files = sum(1 for _ in repo_path.rglob("*") if _.is_file())
+        file_lang_pairs = walk_source_files(repo_path, changed_files)
+
+        if file_lang_pairs:
+            break
+
+        # Zero source files on disk but the repo should have code: the
+        # checkout is corrupt — wipe cache + directory and re-clone ONCE.
+        if attempt == 0:
+            logger.warning(
+                f"Checkout for {repo_url} yielded 0 source files "
+                f"({total_all_files} files on disk) — forcing clean re-clone"
+            )
+            yield {"type": "progress", "stage": "cloning", "message": "Checkout looks empty/corrupt — wiping and re-cloning cleanly..."}
+            try:
+                store.delete_collection(repo_url)
+            except Exception:
+                pass
+            force_remove(repo_path)
+            continue
+
+    if not file_lang_pairs:
         yield {
             "type": "error",
             "message": (
@@ -141,6 +171,8 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
             ),
         }
         return
+
+    total_files = len(file_lang_pairs)
     yield {"type": "progress", "stage": "walking", "message": f"Found {total_files} source files", "total": total_files}
 
     # 4. Build file tree
@@ -159,6 +191,8 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
     last_heartbeat = time.time()
+    parse_start = time.time()
+    collected_imports: dict[str, list[str]] = {}
 
     async def _flush_chunk_buffer():
         nonlocal chunk_buffer, total_chunks_indexed, last_heartbeat
@@ -191,32 +225,72 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         del texts, embeddings
         gc.collect()
 
-    try:
-        for i, (fp, lang) in enumerate(file_lang_pairs):
+    def _parse_one(fp: Path, lang: str):
+        """Chunk one file and harvest its imports for the dependency graph.
+
+        Runs in a worker thread. tree-sitter parsing releases the GIL, and the
+        chunker creates a fresh Parser per call, so this is thread-safe. RAM
+        cost is one file's text in flight per worker — safe even on 512 MB.
+        """
+        file_chunks = chunk_file(fp, repo_path, lang)
+        imports: list[str] = []
+        if lang in GRAPH_LANGS:
             try:
-                file_chunks = chunk_file(fp, repo_path, lang)
-                for c in file_chunks:
-                    if c.chunk_type in ("function", "method"):
-                        func_count += 1
-                    chunk_buffer.append(c)
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                    imports = extract_imports(f.read(), lang)
+            except OSError:
+                pass
+        return fp, file_chunks, imports
 
-                    if len(chunk_buffer) >= EMBED_BATCH_SIZE:
-                        await _flush_chunk_buffer()
+    def _record_parsed(fp: Path, file_chunks, imports):
+        nonlocal func_count
+        for c in file_chunks:
+            if c.chunk_type in ("function", "method"):
+                func_count += 1
+            chunk_buffer.append(c)
+        if imports:
+            try:
+                collected_imports[str(fp.relative_to(repo_path))] = imports
+            except ValueError:
+                pass
 
-            except Exception as e:
-                logger.warning(f"Parse error in {fp}: {e}")
+    try:
+        parse_workers = max(1, config.PARSE_WORKERS)
+        window = max(parse_workers * 8, 16)
+        processed = 0
 
-            # Send progress update and keep-alive heartbeats
-            now = time.time()
-            if (i + 1) % 5 == 0 or (now - last_heartbeat) > 3.0 or (i + 1) == total_files:
-                last_heartbeat = now
-                yield {
-                    "type": "progress",
-                    "stage": "parsing",
-                    "current": i + 1,
-                    "total": total_files,
-                    "message": f"Processed {i + 1}/{total_files} files ({total_chunks_indexed + len(chunk_buffer)} chunks)",
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parse_workers) as executor:
+            for w_start in range(0, total_files, window):
+                file_window = file_lang_pairs[w_start:w_start + window]
+                futures = {
+                    executor.submit(_parse_one, fp, lang): (fp, lang)
+                    for fp, lang in file_window
                 }
+                for future in concurrent.futures.as_completed(futures):
+                    fp, _ = futures[future]
+                    processed += 1
+                    try:
+                        _, file_chunks, imports = future.result()
+                        _record_parsed(fp, file_chunks, imports)
+                        if len(chunk_buffer) >= EMBED_BATCH_SIZE:
+                            await _flush_chunk_buffer()
+                    except Exception as e:
+                        logger.warning(f"Parse error in {fp}: {e}")
+
+                    # Send progress update and keep-alive heartbeats
+                    now = time.time()
+                    if processed % 5 == 0 or (now - last_heartbeat) > 3.0 or processed == total_files:
+                        last_heartbeat = now
+                        elapsed = max(now - parse_start, 0.001)
+                        chunks_so_far = total_chunks_indexed + len(chunk_buffer)
+                        yield {
+                            "type": "progress",
+                            "stage": "parsing",
+                            "current": processed,
+                            "total": total_files,
+                            "chunks_per_sec": round(chunks_so_far / elapsed, 1),
+                            "message": f"Processed {processed}/{total_files} files ({chunks_so_far} chunks)",
+                        }
 
         # Flush any remaining chunks
         if chunk_buffer:
@@ -261,12 +335,37 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         "languages": languages[:8],
     }
 
-    # 9. Snapshot & final storage
+    # 9. Build the dependency graph from the imports harvested while parsing
+    graph_payload = None
+    try:
+        merged_imports: dict[str, list[str]] = {}
+        if changed_files is not None:
+            # Incremental update: keep the previous graph edges for unchanged files.
+            existing = get_saved_graph(repo_url)
+            if existing:
+                merged_imports.update(existing.get("imports_of", {}))
+        merged_imports.update(collected_imports)
+
+        if merged_imports:
+            full_pairs = walk_source_files(repo_path)
+            all_paths = [str(fp.relative_to(repo_path)) for fp, _ in full_pairs]
+            lang_map = {str(fp.relative_to(repo_path)): lang for fp, lang in full_pairs}
+            graph_payload = build_dependency_graph(merged_imports, all_paths, lang_map)
+    except Exception as e:
+        logger.warning(f"Dependency graph build failed (non-critical): {e}")
+
+    # 10. Snapshot & final storage
     yield {"type": "progress", "stage": "storing", "message": "Saving snapshot & finalizing index..."}
     try:
         create_snapshot(repo_url, repo_path, tree, stats)
     except Exception as e:
         logger.warning(f"Snapshot creation failed (non-critical): {e}")
+
+    if graph_payload:
+        try:
+            save_graph(repo_url, graph_payload)
+        except Exception as e:
+            logger.warning(f"Dependency graph save failed (non-critical): {e}")
 
     gc.collect()
 
@@ -277,4 +376,5 @@ async def index_repo(repo_url: str) -> AsyncGenerator[dict, None]:
         "time_seconds": round(time.time() - start, 1),
         "commit_hash": commit_hash,
         "is_incremental": changed_files is not None,
+        "graph_edges": graph_payload.get("num_edges", 0) if graph_payload else 0,
     }

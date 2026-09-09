@@ -8,13 +8,13 @@ const SLASH_COMMANDS = [
   {
     cmd: '/grill-me',
     label: '/grill-me',
-    desc: 'Interactive guided exploration of architecture & design trade-offs',
-    prompt: '/grill-me on key architectural components and design decisions',
+    desc: 'Critical design review — severity-ranked findings with file:line evidence',
+    prompt: '/grill-me on this codebase architecture and key design decisions',
   },
   {
     cmd: '/architecture',
     label: '/architecture',
-    desc: 'Generate complete multi-tier architecture breakdown and diagram',
+    desc: 'Multi-tier architecture breakdown + diagram from the real import graph',
     prompt: '/architecture of this repository with full component diagram',
   },
   {
@@ -33,7 +33,25 @@ const SLASH_COMMANDS = [
     cmd: '/components',
     label: '/components',
     desc: 'Breakdown of primary modules, services, and classes',
-    prompt: 'Explain the core components, modules, and file responsibilities',
+    prompt: '/components — explain the core modules and file responsibilities',
+  },
+  {
+    cmd: '/security',
+    label: '/security',
+    desc: 'Vulnerability scan: injection, secrets, auth gaps — with fix sketches',
+    prompt: '/security scan of this codebase — find severity-ranked vulnerabilities',
+  },
+  {
+    cmd: '/complexity',
+    label: '/complexity',
+    desc: 'Complexity & coupling hotspot report with refactor suggestions',
+    prompt: '/complexity report — identify hotspots, god objects, and coupling issues',
+  },
+  {
+    cmd: '/onboarding',
+    label: '/onboarding',
+    desc: 'New-developer walkthrough: reading order, runtime path, build steps',
+    prompt: '/onboarding guide — how a new developer should explore this codebase',
   },
 ];
 
@@ -62,6 +80,19 @@ function backendErrorMessage(status) {
     return 'Backend server is not responding. Ensure the backend is active at port 8000.';
   }
   return `Server error (HTTP ${status})`;
+}
+
+// Tolerate '/grill me' (with a space), missing hyphens, and trailing args —
+// map the first word to a real command before it goes to the backend.
+function normalizeSlashCommand(text) {
+  if (!text.startsWith('/')) return text;
+  const m = text.match(/^\/([a-z-]+)(?:\s+(me))?(?:\s+(.*))?$/i);
+  if (!m) return text;
+  const letters = ((m[1] || '') + (m[2] || '')).replace(/[^a-z]/gi, '').toLowerCase();
+  const hit = SLASH_COMMANDS.find(c => c.cmd.replace(/[^a-z]/gi, '').toLowerCase() === letters);
+  if (!hit) return text;
+  const tail = m[2] && hit.cmd.endsWith('-me') ? m[3] : [m[2], m[3]].filter(Boolean).join(' ');
+  return tail ? `${hit.cmd} ${tail}` : hit.cmd;
 }
 
 export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
@@ -115,8 +146,11 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const filteredCommands = input.startsWith('/')
-    ? SLASH_COMMANDS.filter(c => c.cmd.toLowerCase().startsWith(input.trim().toLowerCase()) || input === '/')
+  // Menu is only active while typing the command token itself (no space yet);
+  // once a command is accepted or args began, the palette closes.
+  const slashToken = input.startsWith('/') && !/\s/.test(input) ? input.toLowerCase() : null;
+  const filteredCommands = slashToken !== null
+    ? SLASH_COMMANDS.filter(c => c.cmd.toLowerCase().startsWith(slashToken) || slashToken === '/')
     : [];
 
   useEffect(() => {
@@ -126,7 +160,7 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
 
   const send = useCallback(async (e, overrideQ) => {
     e?.preventDefault();
-    const q = (overrideQ || input).trim();
+    const q = normalizeSlashCommand((overrideQ || input).trim());
     if (!q || streaming) return;
 
     setInput('');
@@ -213,10 +247,30 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
     send(null, optionText);
   }, [send]);
 
+  // Antigravity-style: selecting a command INSERTS it in the composer so the
+  // user can add context after it (or just hit Enter to run it as-is).
   const handleSelectSlash = (cmdObj) => {
     setShowSlashMenu(false);
-    send(null, cmdObj.prompt);
+    setInput(cmdObj.cmd + ' ');
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      autosize();
+    });
   };
+
+  const autosize = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+  }, []);
+
+  // Keep the highlighted menu row visible while arrow-key navigating
+  useEffect(() => {
+    if (showSlashMenu) {
+      document.querySelector('.slash-item.active')?.scrollIntoView({ block: 'nearest' });
+    }
+  }, [slashIdx, showSlashMenu]);
 
   const handleKeyDown = useCallback((e) => {
     if (showSlashMenu && filteredCommands.length > 0) {
@@ -358,12 +412,17 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
         {/* Slash Command Autocomplete Popover */}
         {showSlashMenu && (
           <div className="slash-menu">
-            <div className="slash-menu-header">COMMANDS</div>
+            <div className="slash-menu-header">
+              <span>COMMANDS</span>
+              <span className="slash-menu-hint">↑↓ navigate · Tab/Enter select · Esc close</span>
+            </div>
             {filteredCommands.map((c, i) => (
               <div
                 key={c.cmd}
                 className={`slash-item ${i === slashIdx ? 'active' : ''}`}
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => handleSelectSlash(c)}
+                onMouseEnter={() => setSlashIdx(i)}
               >
                 <div className="slash-item-cmd">{c.label}</div>
                 <div className="slash-item-desc">{c.desc}</div>
@@ -373,22 +432,26 @@ export default function ChatInterface({ repoUrl, askAboutFile, onAskHandled }) {
         )}
 
         <form className="chat-bar" onSubmit={send}>
-          <input
+          <textarea
             ref={inputRef}
-            type="text"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => { setInput(e.target.value); requestAnimationFrame(autosize); }}
             onKeyDown={handleKeyDown}
-            placeholder={streaming ? 'Analyzing codebase…' : 'Ask anything, or type / for commands (/grill-me, /architecture)…'}
+            onBlur={() => setTimeout(() => setShowSlashMenu(false), 150)}
+            placeholder={streaming ? 'Analyzing codebase…' : 'Ask anything — or type / for commands (/grill-me, /architecture)…'}
             disabled={streaming}
             className="chat-input"
+            rows={1}
           />
-          <button type="submit" className="chat-send" disabled={!input.trim() || streaming}>
+          <button type="submit" className="chat-send" disabled={!input.trim() || streaming} title="Send (Enter)">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
               <path d="M1 1l14 7-14 7V9l9-1-9-1V1z"/>
             </svg>
           </button>
         </form>
+        <div className="composer-hint">
+          <kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline · <kbd>/</kbd> commands
+        </div>
       </div>
     </div>
   );
