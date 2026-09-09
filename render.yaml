@@ -28,7 +28,11 @@ services:
       - key: CQ_LLM_PROVIDER
         value: groq
       - key: CQ_GROQ_MODEL
-        value: llama-3.3-70b-versatile
+        value: openai/gpt-oss-20b  # Free on Groq free tier (llama-3.3-70b-versatile is retired/Enterprise-only)
+      - key: CQ_RETRIEVAL_TOP_K
+        value: "4"  # Trimmed from 12 to stay under free tier's 8K TPM
+      - key: CQ_MAX_CHUNK_CHARS
+        value: "1500"  # 4 chunks x 1500 chars ~1.5K tokens per prompt
       - key: GROQ_API_KEY
         sync: false  # Set this manually in the Render dashboard — never commit API keys
 
@@ -77,7 +81,5 @@ services:
       - key: CQ_AUTO_CLEANUP_ON_RESET
         value: "true"
 
-      # Optional: To use Google Gemini Free Embeddings instead of FastEmbed:
-      # Set CQ_EMBEDDING_PROVIDER=gemini and GEMINI_API_KEY in Render environment
 
 

@@ -254,6 +254,11 @@ async def generate_answer(
             "temperature": 0.1,
             "stream": True,
         }
+        # gpt-oss models burn hidden reasoning tokens unless told otherwise;
+        # "low" saves free-tier TPM budget and cuts latency. Conditional because
+        # non-gpt-oss models reject this param with a 400.
+        if "gpt-oss" in config.GROQ_MODEL:
+            payload["reasoning_effort"] = "low"
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 async with client.stream(
@@ -412,6 +417,8 @@ async def generate_simple(prompt: str, system: str = "", max_tokens: int = 300) 
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if "gpt-oss" in config.GROQ_MODEL:
+            payload["reasoning_effort"] = "low"
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",

@@ -17,7 +17,7 @@ SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 # LLM — "ollama" or "groq"
 LLM_PROVIDER = os.getenv("CQ_LLM_PROVIDER", "ollama")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("CQ_GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("CQ_GROQ_MODEL", "openai/gpt-oss-20b")
 
 OLLAMA_BASE_URL = os.getenv("CQ_OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("CQ_OLLAMA_MODEL", "qwen2.5-coder:7b")
